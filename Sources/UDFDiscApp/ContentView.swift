@@ -194,6 +194,8 @@ struct Detail: View {
         groupSpacer
         ToolbarItemGroup(placement: .primaryAction) {
             Menu {
+                SortMenu()
+                Divider()
                 Button(L("检查光盘", "Check Disc")) { Task { await model.runCheck() } }
                 Button(L("刷新", "Refresh")) { Task { await model.refresh() } }
                 Divider()
@@ -261,8 +263,9 @@ struct FileTable: View {
     }()
 
     var body: some View {
-        Table(model.entries, selection: $model.selection) {
-            TableColumn(L("名称", "Name")) { e in
+        // Click a column header to sort by it, again to reverse; folders stay on top.
+        Table(model.displayedEntries, selection: $model.selection, sortOrder: $model.sortOrder) {
+            TableColumn(L("名称", "Name"), value: \UDFEntry.name) { e in
                 HStack(spacing: 6) {
                     Image(nsImage: FileKinds.icon(for: e)).resizable().frame(width: 18, height: 18)
                     Text(e.name).truncationMode(.middle)
@@ -272,16 +275,16 @@ struct FileTable: View {
                 .opacity(e.isHidden ? 0.5 : 1)
             }
             .width(min: 200, ideal: 320)
-            TableColumn(L("种类", "Kind")) { e in
+            TableColumn(L("种类", "Kind"), value: \UDFEntry.kindName) { e in
                 Text(FileKinds.kind(of: e)).foregroundStyle(.secondary).lineLimit(1)
             }
             .width(min: 70, ideal: 110)
-            TableColumn(L("大小", "Size")) { e in
+            TableColumn(L("大小", "Size"), value: \UDFEntry.size) { e in
                 Text(e.isDirectory ? "--" : ByteCountFormatter.string(fromByteCount: Int64(e.size), countStyle: .file))
                     .foregroundStyle(.secondary).monospacedDigit()
             }
             .width(min: 70, ideal: 90)
-            TableColumn(L("修改日期", "Date Modified")) { e in
+            TableColumn(L("修改日期", "Date Modified"), value: \UDFEntry.sortDate) { e in
                 Text(e.modified.map { Self.dateFormat.string(from: $0) } ?? "")
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
@@ -432,5 +435,20 @@ struct CheckReportView: View {
         }
         .padding(20)
         .frame(width: 480)
+    }
+}
+
+/// “Sort By” and “Ascending / Descending”, as in the Finder's View menu.
+struct SortMenu: View {
+    @EnvironmentObject var model: AppModel
+
+    var body: some View {
+        Picker(L("排序方式", "Sort By"), selection: $model.sortKey) {
+            ForEach(EntrySort.allCases, id: \.self) { Text($0.title).tag($0) }
+        }
+        Picker(L("顺序", "Order"), selection: $model.sortAscending) {
+            Text(L("升序", "Ascending")).tag(true)
+            Text(L("降序", "Descending")).tag(false)
+        }
     }
 }

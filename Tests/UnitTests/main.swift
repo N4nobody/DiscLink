@@ -235,6 +235,41 @@ test("整卷：写入失败后光盘保持原样") {
     expect(reopened.freeBytes == v.freeBytes)
 }
 
+// MARK: - Sorting
+
+func entry(_ name: String, dir: Bool = false, size: UInt64 = 0, day: Int? = nil) -> UDFEntry {
+    UDFEntry(name: name, path: name, isDirectory: dir, size: size,
+             modified: day.map { Date(timeIntervalSince1970: TimeInterval($0) * 86_400) }, isHidden: false,
+             icb: LBAddr(block: 0, partition: 0))
+}
+
+test("排序：文件夹在前，名称按自然顺序") {
+    // Latin names only: how Chinese sorts against Latin depends on the system language
+    // (on a Chinese system Han characters come first, the same as in the Finder).
+    let list = [entry("file10.txt"), entry("Photos", dir: true), entry("file2.txt"), entry("B.pdf"), entry("a.pdf"), entry("Archive", dir: true)]
+    expect(EntrySort.name.sorted(list, ascending: true).map(\.name) == ["Archive", "Photos", "a.pdf", "B.pdf", "file2.txt", "file10.txt"])
+    expect(EntrySort.name.sorted(list, ascending: false).map(\.name) == ["Photos", "Archive", "file10.txt", "file2.txt", "B.pdf", "a.pdf"],
+           "降序时文件夹仍在前")
+}
+
+test("排序：按大小、日期，相同值按名称") {
+    let list = [entry("c", size: 300, day: 3), entry("a", size: 100, day: 9), entry("b", size: 300, day: 1), entry("d", dir: true)]
+    expect(EntrySort.size.sorted(list, ascending: true).map(\.name) == ["d", "a", "b", "c"])
+    expect(EntrySort.size.sorted(list, ascending: false).map(\.name) == ["d", "b", "c", "a"], "同样大小时按名称 A→Z")
+    expect(EntrySort.date.sorted(list, ascending: false).map(\.name) == ["d", "a", "c", "b"])
+    let noDate = [entry("x"), entry("y", day: 1)]
+    expect(EntrySort.date.sorted(noDate, ascending: true).map(\.name) == ["x", "y"], "没有日期的排在最早")
+}
+
+test("排序：按种类") {
+    let list = [entry("photo.jpg"), entry("notes.txt"), entry("report.pdf"), entry("scan.pdf")]
+    let kinds = ["jpg": "JPEG image", "txt": "Plain Text", "pdf": "PDF document"]
+    let sorted = EntrySort.kind.sorted(list, ascending: true, kind: { kinds[($0.name as NSString).pathExtension] ?? "" })
+    expect(sorted.map(\.name) == ["photo.jpg", "report.pdf", "scan.pdf", "notes.txt"], "\(sorted.map(\.name))")
+    expect(EntrySort.kind.sorted(list, ascending: false, kind: { kinds[($0.name as NSString).pathExtension] ?? "" }).map(\.name)
+           == ["notes.txt", "report.pdf", "scan.pdf", "photo.jpg"], "降序时同种类仍按名称 A→Z")
+}
+
 // MARK: - Report
 
 print("\n通过 \(passed)，失败 \(failed.count)")

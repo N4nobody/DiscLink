@@ -21,7 +21,7 @@ The app is called “光盘通” on Chinese systems and “DiscLink” elsewher
 - ✅ App “DiscLink”: browse, add files (button or drag and drop), create folders, export, delete, check the disc, eject
 - ✅ Liquid Glass design on macOS 26 and later: the path and status float over the file list as glass capsules, toolbar actions are grouped; macOS 14–15 get the classic look. Requires macOS 14 or later
 - ✅ App icon: a complete silver disc on blue with a Liquid Glass badge (a clear glass ring, a blue puck and two-way arrows) over its lower right edge. Built as a layered Icon Composer icon (`Resources/AppIcon.icon`); the clear ring has refraction turned on, so it bends the disc's rim and tracks beneath it (the same technique as the Maps app icon). macOS 26+ renders it and adapts it to the light, dark, tinted and clear icon styles; macOS 14–15 use a regular icon that actool generates alongside. Without Xcode, the build script falls back to a flat picture (`Resources/AppIcon-1024.png`)
-- ✅ All tests pass: 14 unit tests and 119 end-to-end tests (images simulating packet writing with 16- and 32-block packets, and write-once discs including the 7 link blocks a CD-R drive leaves after every write; results cross-checked with macOS's own UDF driver)
+- ✅ All tests pass: 17 unit tests and 119 end-to-end tests (images simulating packet writing with 16- and 32-block packets, and write-once discs including the 7 link blocks a CD-R drive leaves after every write; results cross-checked with macOS's own UDF driver)
 - ✅ Tested on real hardware (2026-10-19, LG GP78N external burner + a DVD-R formatted in Windows): reading, appending files and folders and deleting all work; a disc written on the Mac shows up correctly in Windows and Windows can keep adding to it, and the Mac reads and writes it again afterwards
 - ⚠️ Not yet tested on real hardware: CD-RW / DVD±RW / BD-RE (packet writing), CD-R, DVD+R
 
@@ -50,6 +50,7 @@ The app isn't notarized by Apple (it is only signed locally), so the first time 
 - Add files with “Add Files” in the toolbar or by dragging files and folders into the list. Everything written is read back and verified.
 - Double-click a folder to open it; the path at the top takes you back up. Control-click for Export and Delete.
 - The list shows Finder-style icons and a Kind column; hover over a long name to see all of it.
+- Sorting: click a column header (Name, Kind, Size, Date Modified) to sort by it, click again to reverse; or use View › Sort By or the More menu. Folders stay on top, names sort naturally (“file2” before “file10”), and your choice is remembered.
 - The top right shows what kind of disc it is (for example “DVD-R · Write-once disc”); hover over it to see what that disc allows.
 - The bottom bar shows whether the disc can be written (and why not, if it can't), the number of items or the size of the selection, and a storage bar with the free space. “Check Disc” is in the More menu.
 - The first write to a real disc asks for confirmation once; try it with an unimportant disc first.
@@ -118,6 +119,7 @@ The unit tests are a plain executable because XCTest and Swift Testing need a fu
 | `UDFKit/UDFWrite+VAT.swift` | Writing write-once discs: appending data and a new VAT |
 | `UDFKit/Check.swift` | Consistency check and troubleshooting output |
 | `UDFKit/Localization.swift` | Chinese / English text |
+| `UDFKit/EntrySort.swift` | Sorting the file list |
 | `Sources/udfdisc/` | Command-line tool |
 | `Sources/UDFDiscApp/` | The SwiftUI app; `Glass.swift` holds the Liquid Glass effects and their fallbacks for older systems |
 | `scripts/build_app.sh` | Builds the .app, including the icon |

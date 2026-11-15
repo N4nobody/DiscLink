@@ -65,7 +65,11 @@ final class AppModel: ObservableObject {
     @Published var source: Source?
     @Published private(set) var info: VolumeInfo?
     @Published private(set) var path = ""
-    @Published private(set) var entries: [UDFEntry] = []
+    @Published private(set) var entries: [UDFEntry] = [] { didSet { resort() } }
+    /// `entries` in the chosen order; this is what the list shows.
+    @Published private(set) var displayedEntries: [UDFEntry] = []
+    @Published var sortKey: EntrySort = .name { didSet { sortChanged() } }
+    @Published var sortAscending = true { didSet { sortChanged() } }
     @Published var selection = Set<UDFEntry.ID>()
     @Published private(set) var busy: Busy?
     @Published var errorMessage: String?
@@ -98,6 +102,10 @@ final class AppModel: ObservableObject {
     private var discSeenAt: [UInt64: Date] = [:]
 
     init() {
+        if let k = UserDefaults.standard.string(forKey: "sortKey").flatMap(EntrySort.init(rawValue:)) { sortKey = k }
+        if UserDefaults.standard.object(forKey: "sortAscending") != nil {
+            sortAscending = UserDefaults.standard.bool(forKey: "sortAscending")
+        }
         refreshDrives()
         timer = Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { [weak self] _ in
             Task { @MainActor in self?.refreshDrives() }
@@ -430,6 +438,44 @@ final class AppModel: ObservableObject {
     }
 
     var selectedEntries: [UDFEntry] { entries.filter { selection.contains($0.id) } }
+
+    // MARK: Sorting
+
+    private func resort() {
+        displayedEntries = sortKey.sorted(entries, ascending: sortAscending, kind: { $0.kindName })
+    }
+
+    private func sortChanged() {
+        UserDefaults.standard.set(sortKey.rawValue, forKey: "sortKey")
+        UserDefaults.standard.set(sortAscending, forKey: "sortAscending")
+        resort()
+    }
+
+    /// The table's column-header sorting, mapped onto `sortKey` and `sortAscending`.
+    var sortOrder: [KeyPathComparator<UDFEntry>] {
+        get {
+            let order: SortOrder = sortAscending ? .forward : .reverse
+            switch sortKey {
+            case .name: return [KeyPathComparator(\UDFEntry.name, order: order)]
+            case .kind: return [KeyPathComparator(\UDFEntry.kindName, order: order)]
+            case .size: return [KeyPathComparator(\UDFEntry.size, order: order)]
+            case .date: return [KeyPathComparator(\UDFEntry.sortDate, order: order)]
+            }
+        }
+        set {
+            guard let c = newValue.first else { return }
+            let key: EntrySort
+            switch c.keyPath {
+            case \UDFEntry.kindName: key = .kind
+            case \UDFEntry.size: key = .size
+            case \UDFEntry.sortDate: key = .date
+            default: key = .name
+            }
+            if key != sortKey { sortKey = key }
+            let ascending = c.order == .forward
+            if ascending != sortAscending { sortAscending = ascending }
+        }
+    }
 
     func delete(_ items: [UDFEntry]) {
         guard canWrite, !items.isEmpty else { return }

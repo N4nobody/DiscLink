@@ -39,6 +39,11 @@ struct UDFDiscApp: App {
                     .keyboardShortcut("w", modifiers: [.command, .shift])
                     .disabled(model.source == nil || model.busy != nil)
             }
+            // View menu: Sort By, like the Finder.
+            CommandGroup(after: .toolbar) {
+                Divider()
+                SortMenu().environmentObject(model)
+            }
         }
     }
 }

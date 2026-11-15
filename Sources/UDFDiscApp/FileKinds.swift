@@ -7,7 +7,7 @@ import UniformTypeIdentifiers
 enum FileKinds {
     private static var icons: [String: NSImage] = [:]
 
-    static func type(of e: UDFEntry) -> UTType {
+    nonisolated static func type(of e: UDFEntry) -> UTType {
         if e.isDirectory { return .folder }
         let ext = (e.name as NSString).pathExtension
         return ext.isEmpty ? .data : (UTType(filenameExtension: ext) ?? .data)
@@ -21,10 +21,16 @@ enum FileKinds {
         return image
     }
 
-    static func kind(of e: UDFEntry) -> String {
+    nonisolated static func kind(of e: UDFEntry) -> String {
         if e.isDirectory { return L("文件夹", "Folder") }
         return type(of: e).localizedDescription ?? L("文稿", "Document")
     }
+}
+
+extension UDFEntry {
+    /// For sorting the list by the Kind and Date Modified columns.
+    var kindName: String { FileKinds.kind(of: self) }
+    var sortDate: Date { modified ?? .distantPast }
 }
 
 extension DriveInfo {
