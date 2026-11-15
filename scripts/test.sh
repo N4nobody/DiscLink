@@ -11,7 +11,14 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 if ! xcrun --show-sdk-version >/dev/null 2>&1 && [ -d /Library/Developer/CommandLineTools ]; then
     export DEVELOPER_DIR=/Library/Developer/CommandLineTools
 fi
-if [ $# -ge 1 ]; then W="$1"; mkdir -p "$W"; else W="$(mktemp -d)"; trap 'rm -rf "$W"' EXIT; fi
+# Default to failure: macOS Bash can report $? as zero after a nounset error in an EXIT trap.
+test_status=1
+if [ $# -ge 1 ]; then
+    W="$1"; mkdir -p "$W"
+else
+    W="$(mktemp -d)"
+    trap 'rm -rf "$W"; exit "$test_status"' EXIT
+fi
 cd "$W"
 B="$ROOT/.build/debug/udfdisc"
 export UDFDISC_LANG=zh   # the checks below look for Chinese output
@@ -24,7 +31,7 @@ t_fail() { local d=$1; shift; if "$@" >/dev/null 2>&1; then bad "$d"; else ok "$
 same()   { cmp -s "$1" "$2"; }
 
 echo "== 编译"
-(cd "$ROOT" && swift build 2>&1 | grep -E "error:" && exit 1 || true)
+(cd "$ROOT" && swift build)
 echo "== 单元测试"
 if (cd "$ROOT" && swift run -q udfkit-tests) | sed 's/^/  /'; then ok "单元测试全部通过"; else bad "单元测试有失败"; fi
 
@@ -100,7 +107,7 @@ compare_in_macos() {  # mounted at $MP
 rewritable_suite() {  # image, packet size
     local img=$1 pk=$2
     local O=(--packet "$pk" --strict)
-    echo "== $img（可擦写盘，模拟每包 $pk 块，严格对齐）"
+    echo "== ${img}（可擦写盘，模拟每包 $pk 块，严格对齐）"
     t "写入小文件（内嵌在文件条目里）" "$B" put "${O[@]}" "$img" src/tiny.txt /tiny.txt
     t "写入 150KB 文件" "$B" put "${O[@]}" "$img" src/medium.bin /medium.bin
     t "写入 25MB 文件" "$B" put "${O[@]}" "$img" src/large.bin /large.bin
@@ -146,8 +153,8 @@ t "报错后还能继续写" "$B" put small.img src/tiny.txt /t.txt
 write_once_suite() {  # image, link blocks (7 after every write on CD-R; 16 after each flush on DVD-R), alignment
     local img=$1 link=$2 align=${3:-1}
     local O=(--sequential --link "$link" --align "$align")
-    if [ "$align" -gt 1 ]; then echo "== $img（一次性写入盘，模拟 DVD-R：刷新时补满 $align 扇区一组，再跳过 $link 个链接扇区）"
-    else echo "== $img（一次性写入盘，模拟 CD-R：每次写入后跳过 $link 个扇区）"; fi
+    if [ "$align" -gt 1 ]; then echo "== ${img}（一次性写入盘，模拟 DVD-R：刷新时补满 $align 扇区一组，再跳过 $link 个链接扇区）"
+    else echo "== ${img}（一次性写入盘，模拟 CD-R：每次写入后跳过 $link 个扇区）"; fi
     if "$B" info "$img" | grep -q "写入：不可用"; then ok "不用追加模式打开时不允许写"; else bad "没有拦截写入"; fi
     t "追加小文件" "$B" put "${O[@]}" "$img" src/tiny.txt /tiny.txt
     t "追加 25MB 文件" "$B" put "${O[@]}" "$img" src/large.bin /large.bin
@@ -183,5 +190,6 @@ format_image r250 200 -r 2.50 -v R250 >/dev/null
 if "$B" info r250.img | grep -q "写入：不可用"; then ok "2.50 只读"; else bad "2.50 未拦截写入"; fi
 
 echo
-echo "通过 $pass，失败 $failn"
-[ "$failn" = 0 ]
+echo "通过 ${pass}，失败 $failn"
+if [ "$failn" = 0 ]; then test_status=0; fi
+exit "$test_status"

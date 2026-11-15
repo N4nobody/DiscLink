@@ -21,7 +21,7 @@ The app is called “光盘通” on Chinese systems and “DiscLink” elsewher
 - ✅ App “DiscLink”: browse, add files (button or drag and drop), create folders, export, delete, check the disc, eject
 - ✅ Liquid Glass design on macOS 26 and later: the path and status float over the file list as glass capsules, toolbar actions are grouped; macOS 14–15 get the classic look. Requires macOS 14 or later
 - ✅ App icon: a complete silver disc on blue with a Liquid Glass badge (a clear glass ring, a blue puck and two-way arrows) over its lower right edge. Built as a layered Icon Composer icon (`Resources/AppIcon.icon`); the clear ring has refraction turned on, so it bends the disc's rim and tracks beneath it (the same technique as the Maps app icon). macOS 26+ renders it and adapts it to the light, dark, tinted and clear icon styles; macOS 14–15 use a regular icon that actool generates alongside. Without Xcode, the build script falls back to a flat picture (`Resources/AppIcon-1024.png`)
-- ✅ All tests pass: 17 unit tests and 119 end-to-end tests (images simulating packet writing with 16- and 32-block packets, and write-once discs including the 7 link blocks a CD-R drive leaves after every write; results cross-checked with macOS's own UDF driver)
+- ✅ All 17 unit tests pass; the full test script passes 121 checks (counting the entire unit suite as one check). End-to-end tests use images simulating packet writing with 16- and 32-block packets, and write-once discs including the 7 link blocks a CD-R drive leaves after every write; results are cross-checked with macOS's own UDF driver
 - ✅ Tested on real hardware (2026-10-19, LG GP78N external burner + a DVD-R formatted in Windows): reading, appending files and folders and deleting all work; a disc written on the Mac shows up correctly in Windows and Windows can keep adding to it, and the Mac reads and writes it again afterwards
 - ⚠️ Not yet tested on real hardware: CD-RW / DVD±RW / BD-RE (packet writing), CD-R, DVD+R
 
@@ -37,7 +37,7 @@ Nothing on a write-once disc can be changed, so every operation appends: first t
 
 ## Download
 
-Download `DiscLink.zip` from the GitHub Releases page, unzip it and drag `DiscLink.app` into your Applications folder. Requires macOS 14 or later.
+Download `DiscLink.zip` from [GitHub Releases](https://github.com/N4nobody/DiscLink/releases), unzip it and drag `DiscLink.app` into your Applications folder. The current download is for Apple silicon (arm64) and requires macOS 14 or later.
 
 The app isn't notarized by Apple (it is only signed locally), so the first time you open it macOS may say the developer can't be verified: Control-click the app, choose Open, then click Open in the dialog.
 
