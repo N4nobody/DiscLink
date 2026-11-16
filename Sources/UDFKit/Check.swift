@@ -56,7 +56,21 @@ extension UDFVolume {
         }
         var visited = Set<LBAddr>()
         func walk(_ dir: FileEntry, _ path: String) throws {
-            for f in try readFIDs(dir) where !f.isDeleted && !f.isParent {
+            let fids = try readFIDs(dir)
+            if vatRef != nil && dir.adType != 3 {
+                let name = path.isEmpty ? "/" : path
+                if dir.extents.contains(where: { $0.kind != .notAllocated && $0.location.partition != physRef }) {
+                    report.problems.append(L("\(name)：一次性写入盘的目录数据未引用物理分区，可能无法被 Windows 识别", "\(name): write-once directory data does not reference physical space and may not be recognized by Windows"))
+                }
+                var offset = 0
+                for f in fids {
+                    if offset % blockSize > blockSize - 16 {
+                        report.problems.append(L("\(name)：目录项标签跨越逻辑块边界（偏移 \(offset)）", "\(name): a directory entry tag crosses a logical block boundary (offset \(offset))"))
+                    }
+                    offset += f.size
+                }
+            }
+            for f in fids where !f.isDeleted && !f.isParent {
                 let p = path + "/" + f.name
                 guard !visited.contains(f.icbAddr) else { continue }   // hard link
                 visited.insert(f.icbAddr)

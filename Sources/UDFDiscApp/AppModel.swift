@@ -83,6 +83,7 @@ final class AppModel: ObservableObject {
     @Published var newFolderName = ""
     @Published var askingFolderName = false
     @Published var confirmingDelete = false
+    @Published var confirmingDirectoryRepair = false
     @Published var dropTargeted = false
 
     /// The UDFVolume is not thread-safe: it is only ever touched on this queue.
@@ -113,6 +114,7 @@ final class AppModel: ObservableObject {
     }
 
     var canWrite: Bool { info != nil && info?.readOnlyReason == nil && busy == nil }
+    var canRepairDirectory: Bool { canWrite && info?.isWriteOnce == true }
     var pathComponents: [String] { path.split(separator: "/").map(String.init) }
 
     func refreshDrives() {
@@ -234,6 +236,7 @@ final class AppModel: ObservableObject {
 
     /// Releases the disc. For a drive this gives it back to macOS, which mounts it again.
     func close() async {
+        confirmingDirectoryRepair = false
         guard let vol = volume else { return }
         if let d = currentDrive { releasedAt[d.stableID] = Date() }
         volume = nil
@@ -261,6 +264,7 @@ final class AppModel: ObservableObject {
         let ours = currentDrive?.stableID == drive.stableID
         let vol = ours ? volume : nil
         if ours {
+            confirmingDirectoryRepair = false
             volume = nil
             info = nil
             entries = []
@@ -347,6 +351,7 @@ final class AppModel: ObservableObject {
     }
 
     func go(to newPath: String) async {
+        confirmingDirectoryRepair = false
         path = newPath
         selection = []
         await refresh()
@@ -434,6 +439,17 @@ final class AppModel: ObservableObject {
         let target = path.isEmpty ? trimmed : path + "/" + trimmed
         guardWrite { [self] in
             Task { await self.perform(L("正在新建文件夹…", "Creating the folder…")) { v, _ in try v.makeDirectory(target) } }
+        }
+    }
+
+    /// Called only after the dedicated repair confirmation, which explains the append
+    /// and asks the user to back up the disc before continuing.
+    func repairCurrentDirectory() async {
+        guard canRepairDirectory else { return }
+        confirmingDirectoryRepair = false
+        let target = path
+        await perform(L("正在修复目录兼容性…", "Repairing folder compatibility…")) { v, _ in
+            try v.repairDirectoryLayout(target)
         }
     }
 

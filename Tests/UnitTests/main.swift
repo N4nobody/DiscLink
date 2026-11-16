@@ -235,6 +235,288 @@ test("整卷：写入失败后光盘保持原样") {
     expect(reopened.freeBytes == v.freeBytes)
 }
 
+// MARK: - Write-once directory layout regressions
+
+// These tests use only disposable image files. They intentionally reproduce the 2036-byte
+// directory boundary that made a DVD-R unreadable to Windows despite passing our checker.
+func writeOnceImage(_ name: String) throws -> URL {
+    let url = blankFile(name, sectors: 32_768)
+    let p = Process(), output = Pipe()
+    p.executableURL = URL(fileURLWithPath: "/sbin/newfs_udf")
+    p.arguments = ["-b", "2048", "-r", "2.01", "-m", "blk", "-t", "wo", "-v", "DIRTEST", url.path]
+    p.standardOutput = output; p.standardError = output
+    try p.run()
+    let text = String(decoding: output.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+    p.waitUntilExit()
+    guard p.terminationStatus == 0,
+          let line = text.split(separator: "\n").first(where: { $0.contains("last written block address:") }),
+          let last = UInt64(line.split(separator: ":").last!.trimmingCharacters(in: .whitespaces)) else {
+        throw UDFError("无法建立一次性写入测试镜像：\(text)")
+    }
+    let h = try FileHandle(forWritingTo: url)
+    try h.truncate(atOffset: (last + 1) * 2048)
+    try h.close()
+    return url
+}
+
+// Return names whose unpadded FIDs put the following descriptor tag at the chosen offset.
+// The last name is 29 ASCII characters, so its FID is 68 bytes, as in the reported disc.
+func boundaryNames(parentSize: Int, tail: Int) -> [String] {
+    var left = 2048 - tail - parentSize
+    var names: [String] = []
+    while left > 0 {
+        let size = left > 256 ? 128 : left
+        precondition(size >= 40 && size % 4 == 0)
+        let prefix = String(format: "f%03d_", names.count)
+        names.append(prefix + String(repeating: "x", count: size - 39 - prefix.count))
+        left -= size
+    }
+    names.append("last-" + String(repeating: "z", count: 24))
+    return names
+}
+
+func checkPhysicalDirectory(_ v: UDFVolume, _ path: String) throws {
+    let fe = try v.resolve(path).fe
+    expect(fe.infoLength > 2048, "必须实际覆盖多块目录边界")
+    expect(fe.adType == 1, "VAT 目录数据应使用 long_ad 引用物理分区")
+    expect(!fe.extents.isEmpty)
+    for e in fe.extents {
+        expect(e.location.partition == v.physRef, "目录数据不能存放在虚拟分区")
+        expect(e.kind == .recorded)
+    }
+    let data = try v.readAll(fe)
+    expect(UInt64(data.count) == fe.infoLength)
+    var offset = 0
+    while offset + 38 <= data.count {
+        let length = (38 + Int(data[offset + 19]) + Int(data.u16(offset + 36)) + 3) & ~3
+        expect(offset % 2048 <= 2048 - 16, "FID Tag 在偏移 \(offset) 跨块")
+        let tag = Tag.parse(data, at: offset)
+        expect(tag?.identifier == TagID.fileIdentifier.rawValue, "FID CRC 和标签校验必须正确（包括正文跨块的项）")
+        var extentStart = 0
+        var physicalBlock: UInt32?
+        for e in fe.extents {
+            if offset < extentStart + Int(e.length) {
+                physicalBlock = e.location.block + UInt32((offset - extentStart) / 2048)
+                break
+            }
+            extentStart += Int(e.length)
+        }
+        expect(tag?.location == physicalBlock, "FID tagLocation 必须是其真实物理逻辑块，不能假定 CD-R 链接块不存在")
+        let implLength = Int(data.u16(offset + 36))
+        expect(implLength == 0 || (implLength >= 32 && implLength % 4 == 0), "目录填充必须采用合法的 ImplementationUse")
+        offset += length
+    }
+    expect(offset == data.count, "目录不能用裸零字节填充 FID 之间的空隙")
+}
+
+func directoryBoundaryRegression(name: String, link: Int, alignment: Int) throws {
+    let url = try writeOnceImage("directory-\(name).img")
+    let payload = Array("directory regression payload".utf8)
+    let src = work.appendingPathComponent("directory-payload-\(name).txt")
+    try Data(payload).write(to: src)
+    let v = try UDFVolume.open(ImageDevice(url: url, writable: true, sequential: true,
+                                         linkBlocks: link, appendAlignment: alignment, capacityMB: 64))
+    expect(v.isWriteOnce)
+    var expected: [String: [String]] = [:]
+    for tail in [12, 8, 4] {
+        let path = "/edge\(tail)"
+        try v.makeDirectory(path)
+        let parentSize = try v.readFIDs(v.resolve(path).fe).reduce(0) { $0 + $1.size }
+        let names = boundaryNames(parentSize: parentSize, tail: tail)
+        expected[path] = names
+        for filename in names { try v.add(from: src, to: path + "/" + filename) }
+        try checkPhysicalDirectory(v, path)
+        expect(try Set(v.list(path).map(\.name)) == Set(names))
+        expect(try v.readFile(path + "/" + names.last!) == payload)
+    }
+    if alignment == 16 {
+        expect(v.vatLocation.map { ($0 + 1) % 16 == 0 } ?? false, "更新目录后 VAT 仍位于 ECC 块末尾")
+    } else {
+        let dir = try v.resolve("/edge12").fe
+        expect(dir.extents.count >= 2, "CD-R 镜像必须真正产生物理链接间隙")
+        if dir.extents.count >= 2 {
+            let first = dir.extents[0], second = dir.extents[1]
+            expect(second.location.block > first.location.block + (first.length + 2047) / 2048,
+                   "不能仅验证恰好连续的两个目录块")
+        }
+    }
+    expect(try v.check().isClean)
+    v.device.close()
+    let reopened = try UDFVolume.open(ImageDevice(url: url, writable: false))
+    for (path, names) in expected {
+        try checkPhysicalDirectory(reopened, path)
+        expect(try Set(reopened.list(path).map(\.name)) == Set(names))
+        for filename in names { expect(try reopened.readFile(path + "/" + filename) == payload) }
+    }
+    expect(try reopened.check().isClean)
+}
+
+test("一次性目录：DVD-R 的 4/8/12 字节边界、物理地址和重开读取") {
+    try directoryBoundaryRegression(name: "dvd", link: 16, alignment: 16)
+}
+
+test("一次性目录：CD-R 链接间隙中的 FID 位置和跨块 CRC") {
+    try directoryBoundaryRegression(name: "cd", link: 7, alignment: 1)
+}
+
+// Construct the old, nonconforming layout in a disposable image, without relying on the
+// production writer to still contain the bug. This fixture has a tag beginning at 2036
+// and a 2104-byte short_ad pointing into the virtual partition.
+func installLegacyDirectory(_ v: UDFVolume, path: String) throws {
+    let fe = try v.resolve(path).fe
+    var fids = try v.readFIDs(fe)
+    for i in fids.indices { fids[i].implUse = [] }
+    let length = fids.reduce(0) { $0 + $1.size }
+    expect(length == 2104, "旧布局回归样本必须精确重现 2104 字节目录")
+    guard let ref = v.vatRef else { throw UDFError("需要 VAT 测试镜像") }
+    try v.transaction {
+        let first = v.vat.count
+        let blocks = (length + 2047) / 2048
+        v.vat += [UInt32](repeating: 0xFFFF_FFFE, count: blocks)
+        var data = [UInt8](repeating: 0, count: blocks * 2048)
+        var offset = 0
+        for f in fids {
+            data.put16(offset + 16, f.version)
+            data[offset + 18] = f.characteristics
+            data[offset + 19] = UInt8(f.nameRaw.count)
+            data.putBytes(offset + 20, f.icb)
+            data.put16(offset + 36, 0)
+            data.putBytes(offset + 38, f.nameRaw)
+            Tag.write(into: &data, at: offset, id: .fileIdentifier, version: v.tagVersion,
+                      serial: v.tagSerial, location: UInt32(first + offset / 2048), length: f.size)
+            offset += f.size
+        }
+        for i in 0 ..< blocks {
+            try v.writeBlocks(LBAddr(block: UInt32(first + i), partition: UInt16(ref)),
+                              Array(data[(i * 2048) ..< ((i + 1) * 2048)]))
+        }
+        fe.adType = 0
+        fe.infoLength = UInt64(length)
+        fe.extents = [Extent(length: UInt32(length), kind: .recorded,
+                             location: LBAddr(block: UInt32(first), partition: UInt16(ref)))]
+        try v.writeFileEntry(fe)
+    }
+}
+
+test("一次性目录：修复旧跨块布局只追加，文件和时间戳保持不变") {
+    let url = try writeOnceImage("legacy-directory.img")
+    let src = work.appendingPathComponent("legacy-directory.txt")
+    let payload = Array("preserve this content".utf8)
+    try Data(payload).write(to: src)
+    let v = try UDFVolume.open(ImageDevice(url: url, writable: true, sequential: true,
+                                         linkBlocks: 16, appendAlignment: 16, capacityMB: 64))
+    try v.makeDirectory("/legacy")
+    let parentSize = try v.readFIDs(v.resolve("/legacy").fe).reduce(0) { $0 + $1.size }
+    let names = boundaryNames(parentSize: parentSize, tail: 12)
+    for filename in names { try v.add(from: src, to: "/legacy/" + filename) }
+    try installLegacyDirectory(v, path: "/legacy")
+    let oldFE = try v.resolve("/legacy").fe
+    let oldTime = oldFE.modified
+    let oldCounts = (v.vatHeader.u32(136), v.vatHeader.u32(140))
+    let oldData = try v.readAll(oldFE)
+    expect(oldFE.adType == 0 && oldFE.extents.first?.length == 2104)
+    expect(Tag.parse(oldData, at: 2036)?.identifier == TagID.fileIdentifier.rawValue,
+           "坏样本的 CRC 应正确；缺陷是 Tag 位置跨块而非随机损坏")
+    expect(try !v.check().isClean, "检查应识别目录兼容性缺陷，不能只因 CRC 正确就报通过")
+    let prefix = try Data(contentsOf: url)
+    try v.repairDirectoryLayout("/legacy")
+    try checkPhysicalDirectory(v, "/legacy")
+    expect(try v.resolve("/legacy").fe.modified == oldTime)
+    expect(v.vatHeader.u32(136) == oldCounts.0 && v.vatHeader.u32(140) == oldCounts.1)
+    expect(try Data(contentsOf: url).prefix(prefix.count) == prefix, "修复不能改写已有扇区")
+    v.device.close()
+    let reopened = try UDFVolume.open(ImageDevice(url: url, writable: false))
+    try checkPhysicalDirectory(reopened, "/legacy")
+    expect(try Set(reopened.list("/legacy").map(\.name)) == Set(names))
+    for filename in names { expect(try reopened.readFile("/legacy/" + filename) == payload) }
+    expect(try reopened.check().isClean)
+}
+
+// Give an image a precise remaining capacity, including the simulated drive's link
+// blocks and flush padding. A real capacity limit must reject writes too, otherwise a
+// missing preflight could silently succeed despite reporting no available space.
+final class CapacityLimitedImage: SectorDevice {
+    let image: ImageDevice
+    let end: UInt32
+    private(set) var writeAttempts = 0
+    init(_ image: ImageDevice, remaining: UInt32) {
+        self.image = image
+        end = image.sectorCount + remaining
+    }
+    var label: String { image.label }
+    var sectorSize: Int { image.sectorSize }
+    var sectorCount: UInt32 { image.sectorCount }
+    var readOnlyReason: String? { image.readOnlyReason }
+    var packetSectors: Int { image.packetSectors }
+    var packetBase: UInt32 { image.packetBase }
+    var isSequential: Bool { image.isSequential }
+    var lastRecordedSector: UInt32 { image.lastRecordedSector }
+    var appendAlignment: Int { image.appendAlignment }
+    var appendableSectors: UInt32 { min(image.appendableSectors, end - min(end, sectorCount)) }
+    func nextWritableAddress() throws -> UInt32 { try image.nextWritableAddress() }
+    func readSectors(_ lba: UInt32, count: Int) throws -> [UInt8] { try image.readSectors(lba, count: count) }
+    func writeSectors(_ lba: UInt32, _ data: [UInt8]) throws {
+        writeAttempts += 1
+        let link = appendAlignment > 1 ? 0 : image.linkBlocks
+        guard UInt64(lba) + UInt64(data.count / sectorSize + link) <= UInt64(end) else {
+            throw UDFError("测试镜像容量已耗尽")
+        }
+        try image.writeSectors(lba, data)
+    }
+    func synchronize() throws {
+        let extra = appendAlignment > 1
+            ? (appendAlignment - Int(sectorCount) % appendAlignment) % appendAlignment + image.linkBlocks : 0
+        guard UInt64(sectorCount) + UInt64(extra) <= UInt64(end) else {
+            throw UDFError("测试镜像没有刷新所需的空间")
+        }
+        try image.synchronize()
+    }
+    func close() { image.close() }
+}
+
+test("一次性目录：近满 DVD-R/CD-R 修复须在任何追加前拒绝") {
+    let original = try writeOnceImage("capacity-legacy.img")
+    let src = work.appendingPathComponent("capacity-payload.txt")
+    let payload = Array("keep this file even when repair cannot fit".utf8)
+    try Data(payload).write(to: src)
+    let setup = try UDFVolume.open(ImageDevice(url: original, writable: true, sequential: true,
+                                             linkBlocks: 16, appendAlignment: 16, capacityMB: 64))
+    try setup.makeDirectory("/legacy")
+    let parentSize = try setup.readFIDs(setup.resolve("/legacy").fe).reduce(0) { $0 + $1.size }
+    let names = boundaryNames(parentSize: parentSize, tail: 12)
+    for filename in names { try setup.add(from: src, to: "/legacy/" + filename) }
+    try installLegacyDirectory(setup, path: "/legacy")
+    setup.device.close()
+    let before = try Data(contentsOf: original)
+
+    for (name, link, alignment, capacity) in [("dvd", 16, 16, 2), ("cd", 7, 1, 16)] {
+        let url = work.appendingPathComponent("capacity-\(name).img")
+        try FileManager.default.copyItem(at: original, to: url)
+        let device = CapacityLimitedImage(try ImageDevice(url: url, writable: true, sequential: true,
+                                                         linkBlocks: link, appendAlignment: alignment, capacityMB: 64),
+                                          remaining: UInt32(capacity))
+        let v = try UDFVolume.open(device)
+        let oldNWA = try device.nextWritableAddress()
+        let oldVAT = v.vatLocation
+        // Both limits fit the complete two-sector replacement directory, including
+        // CD-R link blocks, but leave no room for its ICB or the committing VAT.
+        expect(device.appendableSectors == UInt32(capacity))
+        var repairError: String?
+        do { try v.repairDirectoryLayout("/legacy") } catch { repairError = error.localizedDescription }
+        expect(repairError != nil, "空间不足时修复必须失败")
+        expect(repairError?.contains("空间不足") == true || repairError?.contains("Not enough space") == true,
+               "应由写前容量检查拒绝，不能等到底层写失败：\(repairError ?? "没有错误")")
+        expect(device.writeAttempts == 0, "\(name)：不能尝试写入目录或回滚 VAT")
+        expect(try device.nextWritableAddress() == oldNWA && v.vatLocation == oldVAT)
+        expect(try Data(contentsOf: url) == before, "\(name)：拒绝修复后整个镜像必须字节不变，不能仅保持旧前缀")
+        device.close()
+        let reopened = try UDFVolume.open(ImageDevice(url: url, writable: false))
+        expect(try Set(reopened.list("/legacy").map(\.name)) == Set(names))
+        for filename in names { expect(try reopened.readFile("/legacy/" + filename) == payload) }
+        reopened.device.close()
+    }
+}
+
 // MARK: - Sorting
 
 func entry(_ name: String, dir: Bool = false, size: UInt64 = 0, day: Int? = nil) -> UDFEntry {

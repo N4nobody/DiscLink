@@ -21,8 +21,9 @@ The app is called “光盘通” on Chinese systems and “DiscLink” elsewher
 - ✅ App “DiscLink”: browse, add files (button or drag and drop), create folders, export, delete, check the disc, eject
 - ✅ Liquid Glass design on macOS 26 and later: the path and status float over the file list as glass capsules, toolbar actions are grouped; macOS 14–15 get the classic look. Requires macOS 14 or later
 - ✅ App icon: a complete silver disc on blue with a Liquid Glass badge (a clear glass ring, a blue puck and two-way arrows) over its lower right edge. Built as a layered Icon Composer icon (`Resources/AppIcon.icon`); the clear ring has refraction turned on, so it bends the disc's rim and tracks beneath it (the same technique as the Maps app icon). macOS 26+ renders it and adapts it to the light, dark, tinted and clear icon styles; macOS 14–15 use a regular icon that actool generates alongside. Without Xcode, the build script falls back to a flat picture (`Resources/AppIcon-1024.png`)
-- ✅ All 17 unit tests pass; the full test script passes 121 checks (counting the entire unit suite as one check). End-to-end tests use images simulating packet writing with 16- and 32-block packets, and write-once discs including the 7 link blocks a CD-R drive leaves after every write; results are cross-checked with macOS's own UDF driver
+- ✅ All 21 unit tests pass; the full test script passes 121 checks (counting the entire unit suite as one check). End-to-end tests use images simulating packet writing with 16- and 32-block packets, and write-once discs including the 7 link blocks a CD-R drive leaves after every write; results are cross-checked with macOS's own UDF driver
 - ✅ Tested on real hardware (2026-10-19, LG GP78N external burner + a DVD-R formatted in Windows): reading, appending files and folders and deleting all work; a disc written on the Mac shows up correctly in Windows and Windows can keep adding to it, and the Mac reads and writes it again afterwards
+- A larger directory written by an older version was found on 2026-11-16 to violate UDF directory addressing and tag-boundary requirements; Win7 prompted to format that disc. The current fix passes image regressions, an offline repair of the actual directory metadata, and readback checks after repairing that DVD-R. On the same day, the user confirmed that the repaired disc passed the Win7 reading test using the same LG GP78N drive.
 - ⚠️ Not yet tested on real hardware: CD-RW / DVD±RW / BD-RE (packet writing), CD-R, DVD+R
 
 ### Problems found and fixed on real hardware
@@ -56,6 +57,8 @@ The app isn't notarized by Apple (it is only signed locally), so the first time 
 - The first write to a real disc asks for confirmation once; try it with an unimportant disc first.
 - Eject: the ⏏ button next to the drive in the sidebar, its context menu, File › Eject Disc (⌘E) or the More menu. With no disc in the drive, ⏏ opens the tray.
 - File › Close Disc (⇧⌘W) only hands the drive back to macOS; it doesn't eject the disc.
+- More › Repair Current Folder Compatibility… appends a replacement layout for a write-once directory written by an older version, preserving file contents. Export a backup before confirming; repair affects only the current folder and stops before writing if space is insufficient. Check Disc also reports incompatible directory addresses and directory entry tags that cross block boundaries.
+- Known observation: the first refresh after one physical-disc repair reported a damaged file entry, while independent readback, checks after reopening, and the Win7 reading test all passed. The cause is not yet established. If this occurs, quit and reopen the disc and run Check Disc before considering another repair; do not repeat repair solely because of this message.
 
 ## Command-line tool
 

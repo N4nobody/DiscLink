@@ -139,6 +139,14 @@ struct Detail: View {
         } message: {
             Text(model.info?.isWriteOnce == true ? L("一次性写入盘上的内容不会真正擦掉，只是不再显示，空间也不会释放。", "On a write-once disc nothing is really erased: deleted items are only hidden, and their space isn't freed.") : L("删除后不能恢复。", "This can't be undone."))
         }
+        .confirmationDialog(repairDirectoryTitle, isPresented: $model.confirmingDirectoryRepair, titleVisibility: .visible) {
+            Button(L("开始修复", "Start Repair")) { Task { await model.repairCurrentDirectory() } }
+                .disabled(!model.canRepairDirectory)
+            Button(L("取消", "Cancel"), role: .cancel) {}
+        } message: {
+            Text(L("请先把光盘上的文件导出备份。修复会向光盘追加当前目录信息，保持原有文件内容，并占用少量剩余空间。",
+                   "Export and back up the files on this disc first. Repair appends information for the current folder, keeps the existing file contents, and uses a small amount of remaining space."))
+        }
     }
 
     @ToolbarContentBuilder
@@ -151,6 +159,11 @@ struct Detail: View {
     private var deleteTitle: String {
         let items = model.selectedEntries
         return items.count == 1 ? L("要删除“\(items[0].name)”吗？", "Delete “\(items[0].name)”?") : L("要删除这 \(items.count) 项吗？", "Delete These \(items.count) Items?")
+    }
+
+    private var repairDirectoryTitle: String {
+        let name = model.pathComponents.last ?? model.info?.name ?? L("光盘", "Disc")
+        return L("修复“\(name)”的目录兼容性？", "Repair Compatibility for Folder \(name)?")
     }
 
     @ToolbarContentBuilder
@@ -197,6 +210,8 @@ struct Detail: View {
                 SortMenu()
                 Divider()
                 Button(L("检查光盘", "Check Disc")) { Task { await model.runCheck() } }
+                Button(L("修复当前目录兼容性…", "Repair Current Folder Compatibility…")) { model.confirmingDirectoryRepair = true }
+                    .disabled(!model.canRepairDirectory)
                 Button(L("刷新", "Refresh")) { Task { await model.refresh() } }
                 Divider()
                 if let d = model.currentDrive {

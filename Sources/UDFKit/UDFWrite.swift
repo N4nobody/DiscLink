@@ -268,9 +268,31 @@ extension UDFVolume {
 
     // MARK: Directories
 
-    /// Rewrites a directory's FIDs (compacting away deleted ones) and its file entry.
-    private func writeDirectory(_ dir: FileEntry, _ fids: [FID], now: Date) throws {
-        let size = fids.reduce(0) { $0 + $1.size }
+    /// Rewrites a directory's FIDs and its file entry, preserving the supplied entries.
+    private func writeDirectory(_ dir: FileEntry, _ originalFIDs: [FID], now: Date?) throws {
+        var fids = originalFIDs
+        var offsets: [Int] = []
+        var size = 0
+        for i in fids.indices {
+            if vatRef != nil {
+                // UDF 2.01 2.3.4.4: a FID body may cross a block boundary, but its
+                // 16-byte tag must not. Extend this FID so the next tag has room.
+                let remaining = (blockSize - (size + fids[i].size) % blockSize) % blockSize
+                if remaining > 0 && remaining < 16 {
+                    let extra = fids[i].implUse.isEmpty ? 32 : remaining
+                    fids[i].implUse += [UInt8](repeating: 0, count: extra)
+                    guard fids[i].implUse.count >= 32 else {
+                        throw UDFError(L("目录条目的实现信息损坏", "A folder entry has invalid implementation information"))
+                    }
+                    EntityID.implementation.write(&fids[i].implUse, 0)
+                }
+                guard fids[i].size <= blockSize else {
+                    throw UDFError(L("目录条目过大，无法按扇区边界写入", "A folder entry is too large to fit the sector layout"))
+                }
+            }
+            offsets.append(size)
+            size += fids[i].size
+        }
         let inlineCap = blockSize - dir.adOffset
         func serialize(locationFor: (Int) -> UInt32, total: Int) -> [UInt8] {
             var buf = [UInt8](repeating: 0, count: total)
@@ -291,7 +313,7 @@ extension UDFVolume {
         }
 
         dir.infoLength = UInt64(size)
-        touch(dir, now)
+        if let now { touch(dir, now) }
         if dir.adType == 3 && size <= inlineCap {
             let data = serialize(locationFor: { _ in dir.addr.block }, total: size)
             try writeFileEntry(dir, inline: data)
@@ -299,12 +321,52 @@ extension UDFVolume {
         }
         // Block-backed directory.
         let need = max(1, (size + blockSize - 1) / blockSize)
-        var blocks: [LBAddr] = []
         if vatRef != nil {
-            // Recorded blocks can't be rewritten: release the old ones, take fresh virtual blocks.
+            // UDF 2.01 2.3.10: directory data belongs in physical space, even when
+            // its ICB is virtual. A short_ad spanning virtual blocks is not valid.
+            var data = serialize(locationFor: { _ in 0 }, total: size)
+            data += [UInt8](repeating: 0, count: need * blockSize - data.count)
+            let partition = maps[Int(physRef)].partition
+            var extents: [Extent] = []
+            var fidIndex = 0
+            for i in 0 ..< need {
+                let at = try device.nextWritableAddress()
+                guard at >= partition.start,
+                      UInt64(at) < UInt64(partition.start) + UInt64(partition.length) else {
+                    throw UDFError(L("目录数据超出可写分区", "Folder data is outside the writable partition"))
+                }
+                let begin = i * blockSize, end = begin + blockSize
+                // Query each sector's actual address: CD-R packet writes can leave
+                // link blocks. Retag the full buffer so a crossing FID keeps its CRC.
+                while fidIndex < fids.count && offsets[fidIndex] < end {
+                    Tag.write(into: &data, at: offsets[fidIndex], id: .fileIdentifier,
+                              version: tagVersion, serial: tagSerial,
+                              location: at - partition.start, length: fids[fidIndex].size)
+                    fidIndex += 1
+                }
+                let runs = try cache.append(Array(data[begin ..< end]))
+                guard runs.count == 1, runs[0].start == at, runs[0].count == 1 else {
+                    throw UDFError(L("目录没有写在预期位置（光驱报告的地址变了）", "The folder didn't land where expected (the drive reported a different address)"))
+                }
+                let length = UInt32(min(blockSize, size - begin))
+                let location = LBAddr(block: at - partition.start, partition: physRef)
+                if var last = extents.last, last.length % UInt32(blockSize) == 0,
+                   last.location.block + last.length / UInt32(blockSize) == location.block,
+                   UInt64(last.length) + UInt64(length) <= 0x3FFF_FFFF {
+                    last.length += length
+                    extents[extents.count - 1] = last
+                } else {
+                    extents.append(Extent(length: length, kind: .recorded, location: location))
+                }
+            }
             if dir.adType != 3 { for e in dir.extents { free(e) } }
-            dir.adType = 0
-        } else if dir.adType != 3 {
+            dir.adType = 1
+            dir.extents = extents
+            try writeFileEntry(dir)
+            return
+        }
+        var blocks: [LBAddr] = []
+        if dir.adType != 3 {
             for e in dir.extents where e.kind != .notAllocated {
                 let n = (Int(e.length) + blockSize - 1) / blockSize
                 for i in 0 ..< n { blocks.append(LBAddr(block: e.location.block + UInt32(i), partition: e.location.partition)) }
@@ -367,6 +429,80 @@ extension UDFVolume {
     }
 
     // MARK: Public write API
+
+    /// Upper bound for a repair plus a complete recovery VAT, checked before any append.
+    private func checkDirectoryRepairCapacity(_ dir: FileEntry, fids: [FID]) throws {
+        guard vatRef != nil else { return }
+        func add(_ a: UInt64, _ b: UInt64) throws -> UInt64 {
+            let (value, overflow) = a.addingReportingOverflow(b)
+            guard !overflow else { throw UDFError(L("空间不足：目录修复的空间需求过大", "Not enough space: the directory repair budget is too large")) }
+            return value
+        }
+        func multiply(_ a: UInt64, _ b: UInt64) throws -> UInt64 {
+            let (value, overflow) = a.multipliedReportingOverflow(by: b)
+            guard !overflow else { throw UDFError(L("空间不足：目录修复的空间需求过大", "Not enough space: the directory repair budget is too large")) }
+            return value
+        }
+        func roundedUp(_ value: UInt64, by unit: UInt64) -> UInt64 {
+            value / unit + (value % unit == 0 ? 0 : 1)
+        }
+
+        // At most 32 padding bytes are added per FID. Assume every directory sector
+        // lands in a separate physical extent, so CD-R links also bound the AED count.
+        var directoryBytes: UInt64 = 0
+        for fid in fids { directoryBytes = try add(directoryBytes, add(UInt64(fid.size), 32)) }
+        let directoryBlocks = max(1, roundedUp(directoryBytes, by: UInt64(blockSize)))
+        let entryCapacity = (blockSize - dir.adOffset) / 16
+        let aedCapacity = (blockSize - 24) / 16 - 1
+        var aedBlocks: UInt64 = 0
+        if directoryBlocks > UInt64(entryCapacity) {
+            guard entryCapacity >= 2, aedCapacity >= 1 else {
+                throw UDFError(L("目录条目空间不足，无法记录分配信息", "Not enough space in the folder entry for allocation descriptors"))
+            }
+            aedBlocks = roundedUp(directoryBlocks - UInt64(entryCapacity - 1), by: UInt64(aedCapacity))
+        }
+        let metadataBlocks = try add(1, aedBlocks) // directory ICB and replacement AEDs
+        let vatEntries = try add(UInt64(vat.count), aedBlocks)
+        let vatBytes = try add(UInt64(vatHeader.count), multiply(vatEntries, 4))
+        let vatBlocks = vatBytes > UInt64(blockSize - 176)
+            ? roundedUp(vatBytes, by: UInt64(blockSize)) : 0
+
+        let alignment = UInt64(max(1, device.appendAlignment))
+        let gap = max(8, alignment) // conservative per-command link/recording-unit allowance
+        // PacketCache appends at most 32 sectors per command. Each VAT needs its data,
+        // up to one alignment unit for its final ICB, and another for a failed flush.
+        // Include link allowance at every append and flush, then reserve TWO VATs:
+        // the attempted commit and the old-state VAT written by vatTransaction on error.
+        let vatCommands = try add(add(roundedUp(vatBlocks, by: 32), roundedUp(alignment, by: 32)), 1)
+        let vatBudget = try add(add(vatBlocks, multiply(alignment, 2)), multiply(gap, vatCommands))
+        let directoryBudget = try multiply(directoryBlocks, add(1, gap))
+        let metadataBudget = try add(metadataBlocks, multiply(gap, roundedUp(metadataBlocks, by: 32)))
+        let required = try add(add(directoryBudget, metadataBudget), multiply(vatBudget, 2))
+
+        let nwa = UInt64(try device.nextWritableAddress())
+        let partition = maps[Int(physRef)].partition
+        let partitionEnd = try add(UInt64(partition.start), UInt64(partition.length))
+        let inPartition = nwa >= UInt64(partition.start) && nwa < partitionEnd
+        let available = min(UInt64(device.appendableSectors), inPartition ? partitionEnd - nwa : 0)
+        guard available >= required else {
+            throw UDFError(L("空间不足：目录修复需要预留 \(required) 个扇区（含失败恢复空间），当前可用 \(available) 个",
+                             "Not enough space: folder repair requires \(required) reserved sectors, including recovery space; \(available) are available"))
+        }
+    }
+
+    /// Rewrites one existing directory's layout without adding or removing entries,
+    /// changing its timestamps, or changing file contents. On write-once discs this
+    /// appends replacement directory data and commits it with a new VAT.
+    public func repairDirectoryLayout(_ path: String = "/") throws {
+        let dir = try resolve(path).fe
+        let fids = try readFIDs(dir)
+        // Keep this outside vatTransaction: a rejected preflight must never attempt
+        // even the transaction's recovery write.
+        try checkDirectoryRepairCapacity(dir, fids: fids)
+        try transaction {
+            try writeDirectory(dir, fids, now: nil)
+        }
+    }
 
     /// Creates a folder. Intermediate folders must exist.
     public func makeDirectory(_ path: String) throws {
