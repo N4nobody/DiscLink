@@ -141,6 +141,17 @@ public final class OpticalDrive: SectorDevice {
 
     struct Sense: Error { let key: UInt8, asc: UInt8, ascq: UInt8 }
 
+    /// READ(10) has a fixed transfer size. Inquiry/configuration commands can return
+    /// fewer bytes than their allocation length, so leave those replies unchanged.
+    static func validateReadTransfer(_ cdb: [UInt8], expected: Int, transferred: UInt64) throws {
+        guard cdb.first == 0x28 else { return }
+        guard transferred == UInt64(expected) else {
+            let position = cdb.count >= 6 ? String(cdb.be32(2)) : "?"
+            throw UDFError(L("读取扇区 \(position) 不完整：需要 \(expected) 字节，实际返回 \(transferred) 字节",
+                             "Incomplete read at sector \(position): expected \(expected) bytes, received \(transferred)"))
+        }
+    }
+
     @discardableResult
     private func exec(_ cdb: [UInt8], in length: Int = 0, out data: [UInt8]? = nil, timeout: UInt32 = 30_000) throws -> [UInt8] {
         guard let h = handle else { throw UDFError(L("光驱已关闭", "The drive has been closed")) }
@@ -158,6 +169,7 @@ public final class OpticalDrive: SectorDevice {
         if status < 0 { throw UDFError(String(format: L("光驱通信失败（IOReturn 0x%08X）", "Communication with the drive failed (IOReturn 0x%08X)"), UInt32(bitPattern: io))) }
         if status == 2 { throw Sense(key: key, asc: asc, ascq: ascq) }
         if status != 0 { throw UDFError(L("光驱返回状态 \(status)", "The drive returned status \(status)")) }
+        try Self.validateReadTransfer(cdb, expected: length, transferred: moved)
         return buf
     }
 

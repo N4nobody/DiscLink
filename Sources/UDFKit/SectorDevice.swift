@@ -167,6 +167,28 @@ public final class PacketCache {
     private func packetIndex(_ lba: UInt32) -> UInt32 { (lba - device.packetBase) / UInt32(packet) }
     private func packetStart(_ idx: UInt32) -> UInt32 { device.packetBase + idx * UInt32(packet) }
 
+    private func readExact(_ lba: UInt32, count: Int) throws -> [UInt8] {
+        let data = try device.readSectors(lba, count: count)
+        let expected = count * ss
+        guard data.count == expected else {
+            throw UDFError(L("读取扇区 \(lba) 不完整：需要 \(expected) 字节，实际返回 \(data.count) 字节",
+                             "Incomplete read at sector \(lba): expected \(expected) bytes, received \(data.count)"))
+        }
+        return data
+    }
+
+    /// Retries one sector without clean read-ahead data. Pending writes still win;
+    /// never discard them or replace them with an older sector from the device.
+    func rereadSector(_ lba: UInt32) throws -> [UInt8] {
+        invalidateClean(lba, count: 1)
+        badUnits.insert(lba / UInt32(readUnit))
+        if lba >= device.packetBase, let p = dirty[packetIndex(lba)] {
+            let off = Int(lba - packetStart(packetIndex(lba)))
+            return Array(p[(off * ss) ..< ((off + 1) * ss)])
+        }
+        return try readExact(lba, count: 1)
+    }
+
     public func read(_ lba: UInt32, count: Int) throws -> [UInt8] {
         var out = [UInt8]()
         out.reserveCapacity(count * ss)
@@ -190,13 +212,13 @@ public final class PacketCache {
                 guard avail > 0 else { throw UDFError(L("读取越界：扇区 \(cur)", "Read past the end: sector \(cur)")) }
                 do {
                     guard !badUnits.contains(unit) else { throw UDFError("") }
-                    chunk = try device.readSectors(unitStart, count: avail)
+                    chunk = try readExact(unitStart, count: avail)
                     remember(unit, chunk)
                 } catch {
                     // Part of this unit may be unrecorded (the gaps between appends on write-once
                     // discs): fall back to reading just the sector asked for.
                     badUnits.insert(unit)
-                    out += try device.readSectors(cur, count: 1)
+                    out += try readExact(cur, count: 1)
                     cur += 1; remaining -= 1
                     continue
                 }

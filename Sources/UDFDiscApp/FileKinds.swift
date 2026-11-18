@@ -27,12 +27,6 @@ enum FileKinds {
     }
 }
 
-extension UDFEntry {
-    /// For sorting the list by the Kind and Date Modified columns.
-    var kindName: String { FileKinds.kind(of: self) }
-    var sortDate: Date { modified ?? .distantPast }
-}
-
 extension DriveInfo {
     /// The model name without the vendor prefix ("DVDRAM GP78N" rather than "HL-DT-ST DVDRAM GP78N").
     var shortName: String { product.isEmpty ? displayName : product }

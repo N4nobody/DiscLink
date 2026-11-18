@@ -1,7 +1,7 @@
 import Foundation
 
 /// One item in a directory listing.
-public struct UDFEntry: Identifiable, Hashable {
+public struct UDFEntry: Identifiable, Hashable, Sendable {
     public var id: String { path }
     public let name: String
     public let path: String

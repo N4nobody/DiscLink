@@ -6,8 +6,22 @@ extension UDFVolume {
     // MARK: File entries and directories
 
     func loadFileEntry(_ addr: LBAddr) throws -> FileEntry {
-        let b = try readBlocks(addr, 1)
-        guard let t = Tag.parse(b) else { throw UDFError(L("文件条目损坏：\(addr)", "File entry is damaged: \(addr)")) }
+        func entryTag(_ bytes: [UInt8]) -> Tag? {
+            guard bytes.count == blockSize, let tag = Tag.parse(bytes),
+                  16 + Int(tag.crcLength) <= bytes.count,
+                  tag.identifier == TagID.fileEntry.rawValue || tag.identifier == TagID.extendedFileEntry.rawValue else { return nil }
+            return tag
+        }
+        var b = try readBlocks(addr, 1)
+        var tag = entryTag(b)
+        let isStaged = vatRef == Int(addr.partition) && staged[addr.block] != nil
+        if tag == nil && !isStaged {
+            // A full-length read-ahead reply can still contain invalid data. Retry
+            // the original physical sector once, preserving staged/dirty changes.
+            b = try cache.rereadSector(try sector(addr))
+            tag = entryTag(b)
+        }
+        guard let t = tag else { throw UDFError(L("文件条目损坏：\(addr)", "File entry is damaged: \(addr)")) }
         let fe: FileEntry
         switch TagID(rawValue: t.identifier) {
         case .fileEntry: fe = FileEntry(addr: addr, raw: b, extended: false)

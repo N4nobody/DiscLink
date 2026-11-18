@@ -52,7 +52,7 @@ struct Tag {
 // MARK: - Addresses
 
 /// Logical block address inside a partition (lb_addr).
-public struct LBAddr: Hashable, CustomStringConvertible {
+public struct LBAddr: Hashable, CustomStringConvertible, Sendable {
     public var block: UInt32
     public var partition: UInt16
     public var description: String { "p\(partition):\(block)" }

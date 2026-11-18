@@ -195,7 +195,7 @@ struct Detail: View {
                 .help(L("在光盘上新建文件夹", "Create a folder on the disc"))
                 .disabled(!model.canWrite)
             Button { model.exportPanel(model.selectedEntries) } label: { Label(L("导出", "Export"), systemImage: "square.and.arrow.down") }
-                .help(L("把选中的项目复制到 Mac", "Copy the selected items to this Mac"))
+                .help(L("把选中的项目复制到 Mac，也可以拖到访达或桌面", "Copy the selected items to this Mac, or drag them to Finder or the desktop"))
                 .disabled(model.selection.isEmpty || model.busy != nil)
         }
         groupSpacer
@@ -268,58 +268,8 @@ struct PathBar: View {
 struct FileTable: View {
     @EnvironmentObject var model: AppModel
 
-    /// Compact, like the Finder's list view: "今天 17:33", "昨天 09:13", "2026/3/23 16:56".
-    private static let dateFormat: DateFormatter = {
-        let f = DateFormatter()
-        f.dateStyle = .short
-        f.timeStyle = .short
-        f.doesRelativeDateFormatting = true
-        return f
-    }()
-
     var body: some View {
-        // Click a column header to sort by it, again to reverse; folders stay on top.
-        Table(model.displayedEntries, selection: $model.selection, sortOrder: $model.sortOrder) {
-            TableColumn(L("名称", "Name"), value: \UDFEntry.name) { e in
-                HStack(spacing: 6) {
-                    Image(nsImage: FileKinds.icon(for: e)).resizable().frame(width: 18, height: 18)
-                    Text(e.name).truncationMode(.middle)
-                }
-                .lineLimit(1)
-                .help(e.name)
-                .opacity(e.isHidden ? 0.5 : 1)
-            }
-            .width(min: 200, ideal: 320)
-            TableColumn(L("种类", "Kind"), value: \UDFEntry.kindName) { e in
-                Text(FileKinds.kind(of: e)).foregroundStyle(.secondary).lineLimit(1)
-            }
-            .width(min: 70, ideal: 110)
-            TableColumn(L("大小", "Size"), value: \UDFEntry.size) { e in
-                Text(e.isDirectory ? "--" : ByteCountFormatter.string(fromByteCount: Int64(e.size), countStyle: .file))
-                    .foregroundStyle(.secondary).monospacedDigit()
-            }
-            .width(min: 70, ideal: 90)
-            TableColumn(L("修改日期", "Date Modified"), value: \UDFEntry.sortDate) { e in
-                Text(e.modified.map { Self.dateFormat.string(from: $0) } ?? "")
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-                    .help(e.modified.map { $0.formatted(date: .complete, time: .standard) } ?? "")
-            }
-            .width(min: 110, ideal: 140)
-        }
-        .contextMenu(forSelectionType: UDFEntry.ID.self) { ids in
-            let items = model.entries.filter { ids.contains($0.id) }
-            if items.count == 1, items[0].isDirectory {
-                Button(L("打开", "Open")) { Task { await model.go(to: items[0].path) } }
-            }
-            if !items.isEmpty {
-                Button(L("导出…", "Export…")) { model.exportPanel(items) }
-                Divider()
-                Button(L("删除", "Delete")) { model.selection = ids; model.delete(items) }.disabled(!model.canWrite)
-            }
-        } primaryAction: { ids in
-            Task { await model.activate(ids) }
-        }
+        DiscFileTable(model: model)
         .overlay {
             if model.entries.isEmpty {
                 ContentUnavailableView {
@@ -327,16 +277,13 @@ struct FileTable: View {
                 } description: {
                     if model.canWrite { Text(L("把文件拖到这里，或点右上角的“添加文件”，就会写入光盘。", "Drag files here, or click “Add Files” at the top right, to write them to the disc.")) }
                 }
+                .allowsHitTesting(false)
             }
         }
         .overlay {
-            if model.dropTargeted { DropHighlight() }
+            if model.dropTargeted { DropHighlight().allowsHitTesting(false) }
         }
-        .dropDestination(for: URL.self) { urls, _ in
-            guard model.canWrite else { return false }
-            model.add(urls.filter(\.isFileURL))
-            return true
-        } isTargeted: { t in model.dropTargeted = t && model.canWrite }
+
     }
 }
 

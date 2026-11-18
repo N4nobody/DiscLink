@@ -144,6 +144,125 @@ test("空间位图：释放后可再用，只标记改动的块") {
 
 // MARK: - Packet cache
 
+// The image holds the true bytes; faults affect only the requested transfer. This
+// reproduces a drive returning incomplete or invalid batched data without changing
+// the recorded sector, and records whether recovery actually used a single read.
+final class FaultyReadImage: SectorDevice {
+    enum Fault { case none, short(Int), zero, badCRC, overlongCRC, failure }
+    let image: ImageDevice
+    var batchFault: Fault = .none
+    var singleFault: Fault = .none
+    var affectedSector: UInt32?
+    var requests: [(lba: UInt32, count: Int)] = []
+    init(_ image: ImageDevice) { self.image = image }
+    var label: String { image.label }
+    var sectorSize: Int { image.sectorSize }
+    var sectorCount: UInt32 { image.sectorCount }
+    var readOnlyReason: String? { image.readOnlyReason }
+    var packetSectors: Int { image.packetSectors }
+    var packetBase: UInt32 { image.packetBase }
+    var isSequential: Bool { image.isSequential }
+    var lastRecordedSector: UInt32 { image.lastRecordedSector }
+    var appendAlignment: Int { image.appendAlignment }
+    var appendableSectors: UInt32 { image.appendableSectors }
+    func nextWritableAddress() throws -> UInt32 { try image.nextWritableAddress() }
+    func readSectors(_ lba: UInt32, count: Int) throws -> [UInt8] {
+        requests.append((lba, count))
+        var bytes = try image.readSectors(lba, count: count)
+        if let target = affectedSector, !(lba <= target && target < lba + UInt32(count)) { return bytes }
+        let offset = Int((affectedSector ?? lba) - lba) * sectorSize
+        switch count > 1 ? batchFault : singleFault {
+        case .none: return bytes
+        case .short(let n): return Array(bytes.prefix(n))
+        case .zero: return [UInt8](repeating: 0, count: bytes.count)
+        case .badCRC: bytes[offset + 20] ^= 1
+        case .overlongCRC:
+            bytes.put16(offset + 10, UInt16(sectorSize))
+            bytes[offset + 4] = 0
+            for i in 0 ..< 16 where i != 4 { bytes[offset + 4] &+= bytes[offset + i] }
+        case .failure: throw UDFError("Simulated batch read failure")
+        }
+        return bytes
+    }
+    func writeSectors(_ lba: UInt32, _ data: [UInt8]) throws { try image.writeSectors(lba, data) }
+    func synchronize() throws { try image.synchronize() }
+    func close() { image.close() }
+}
+
+func patternedReadImage(_ name: String) throws -> FaultyReadImage {
+    let url = blankFile(name, sectors: 512)
+    var bytes = Data()
+    for sector in 0 ..< 512 { bytes.append(Data(repeating: UInt8(truncatingIfNeeded: sector), count: 2048)) }
+    try bytes.write(to: url)
+    return FaultyReadImage(try ImageDevice(url: url, writable: true))
+}
+
+test("光驱传输：READ(10) 必须完整，变长查询仍可返回较短数据") {
+    let read: [UInt8] = [0x28, 0, 0, 0, 0, 37, 0, 0, 2, 0]
+    try OpticalDrive.validateReadTransfer(read, expected: 4096, transferred: 4096)
+    for actual: UInt64 in [0, 2048, 4095, 4097] {
+        expectThrows({ try OpticalDrive.validateReadTransfer(read, expected: 4096, transferred: actual) },
+                     "不能把 \(actual) 字节的 READ(10) 当作完整的 4096 字节")
+    }
+    try OpticalDrive.validateReadTransfer([0x52, 1, 0, 0, 0, 4, 0, 0, 36, 0], expected: 36, transferred: 32)
+    try OpticalDrive.validateReadTransfer([0x46, 0, 0, 0, 0, 0, 0, 0, 64, 0], expected: 64, transferred: 12)
+}
+
+test("包缓存：短批读转单扇区重读，不能缓存不完整的读取单元") {
+    let device = try patternedReadImage("short-batch.img")
+    defer { device.close() }
+    device.batchFault = .short(2048 + 511)
+    let cache = PacketCache(device)
+    expect(try cache.read(32, count: 1) == [UInt8](repeating: 32, count: 2048))
+    let singleReads = device.requests.filter { $0.count == 1 }
+    expect(singleReads.count == 1 && singleReads.first?.lba == 32, "短批读即使包含首个完整扇区也必须重新读取")
+    // Avoid an infinite loop on the old implementation, which repeatedly cached
+    // and evicted this same short unit when asked for its missing final sector.
+    if singleReads.isEmpty { return }
+    expect(try cache.read(47, count: 1) == [UInt8](repeating: 47, count: 2048))
+    expect(device.requests.filter { $0.count > 1 }.count == 1, "同一个异常读取单元直接按扇区读取")
+}
+
+test("包缓存：短单读明确失败，恢复后重新读取而非返回截断缓存") {
+    let device = try patternedReadImage("short-single.img")
+    defer { device.close() }
+    device.batchFault = .failure
+    device.singleFault = .short(1024)
+    let cache = PacketCache(device)
+    var message: String?
+    do { _ = try cache.read(37, count: 1) } catch { message = error.localizedDescription }
+    expect(message != nil, "单扇区短读不能作为成功数据返回")
+    expect(message?.contains("37") == true && message?.contains("2048") == true && message?.contains("1024") == true,
+           "错误应包含扇区和预期/实际字节数：\(message ?? "没有错误")")
+    let priorReads = device.requests.count
+    device.singleFault = .none
+    expect(try cache.read(37, count: 1) == [UInt8](repeating: 37, count: 2048))
+    expect(device.requests.count > priorReads, "短单读不能进入缓存")
+}
+
+test("包缓存：批读错误后各扇区有效数据仍可完整读取") {
+    let device = try patternedReadImage("failed-batch.img")
+    defer { device.close() }
+    device.batchFault = .failure
+    let cache = PacketCache(device)
+    let expected = (37 ... 39).flatMap { [UInt8](repeating: UInt8($0), count: 2048) }
+    expect(try cache.read(37, count: 3) == expected)
+    expect(device.requests.filter { $0.count == 1 }.map(\.lba) == [37, 38, 39])
+}
+
+test("包缓存：强制单扇区重读仍保留尚未落盘的修改") {
+    let device = try patternedReadImage("dirty-reread.img")
+    defer { device.close() }
+    let cache = PacketCache(device)
+    let pending = [UInt8](repeating: 0xBA, count: 2048)
+    try cache.write(37, pending, allowDirect: false)
+    device.requests.removeAll()
+    expect(try cache.rereadSector(37) == pending)
+    expect(try cache.read(37, count: 1) == pending)
+    expect(device.requests.isEmpty, "重读不能用盘上旧数据覆盖 dirty 数据")
+    expect(try device.image.readSectors(37, count: 1) == [UInt8](repeating: 37, count: 2048))
+}
+
 test("包缓存：零散写入合并成整包，未刷新前能读到新数据") {
     let url = blankFile("packets.img", sectors: 512)
     let dev = try ImageDevice(url: url, writable: true, simulatePacket: 16, strictPackets: true)
@@ -257,6 +376,75 @@ func writeOnceImage(_ name: String) throws -> URL {
     try h.truncate(atOffset: (last + 1) * 2048)
     try h.close()
     return url
+}
+
+func metadataReadFixture(_ name: String) throws -> (volume: UDFVolume, device: FaultyReadImage, root: UInt32, bytes: [UInt8]) {
+    let url = try writeOnceImage(name)
+    let device = FaultyReadImage(try ImageDevice(url: url, writable: false))
+    let volume = try UDFVolume.open(device)
+    let root = try volume.sector(volume.rootICB)
+    let bytes = try volume.loadFileEntry(volume.rootICB).raw
+    device.affectedSector = root
+    volume.cache.discard()
+    device.requests.removeAll()
+    return (volume, device, root, bytes)
+}
+
+test("文件条目：批读全零或 CRC 错误时单扇区读取恢复真实元数据") {
+    let f = try metadataReadFixture("metadata-batch-fault.img")
+    defer { f.device.close() }
+    for fault in [FaultyReadImage.Fault.zero, .badCRC] {
+        f.volume.cache.discard()
+        f.device.requests.removeAll()
+        f.device.batchFault = fault
+        let entry = try f.volume.loadFileEntry(f.volume.rootICB)
+        expect(entry.raw == f.bytes && entry.isDirectory, "返回的必须是盘上真实 FE/EFE，而非全零或忽略 CRC")
+        expect(f.device.requests.filter { $0.lba == f.root && $0.count == 1 }.count == 1,
+               "元数据失败后应按真实物理地址单读一次")
+        expect(f.device.requests.contains { $0.count > 1 }, "本例必须先遭遇整批读取异常")
+    }
+}
+
+test("文件条目：持久坏标签及 CRC 长度越界不能被重试掩盖") {
+    let f = try metadataReadFixture("metadata-permanent-fault.img")
+    defer { f.device.close() }
+    for fault in [FaultyReadImage.Fault.zero, .badCRC, .overlongCRC] {
+        f.volume.cache.discard()
+        f.device.requests.removeAll()
+        f.device.batchFault = fault
+        f.device.singleFault = fault
+        var message: String?
+        do { _ = try f.volume.loadFileEntry(f.volume.rootICB) } catch { message = error.localizedDescription }
+        expect(message?.contains(f.volume.rootICB.description) == true, "重读仍无效时应报告具体文件条目损坏")
+        expect(f.device.requests.filter { $0.lba == f.root && $0.count == 1 }.count == 1,
+               "持久坏数据只能重试一次，不能无限重读或直接接受")
+        f.device.batchFault = .none
+        f.device.singleFault = .none
+        expect(try f.volume.loadFileEntry(f.volume.rootICB).raw == f.bytes, "坏元数据不得成为后续读取的有效缓存")
+    }
+}
+
+test("文件条目：VAT 暂存优先，不能用盘上旧的有效条目掩盖暂存损坏") {
+    let f = try metadataReadFixture("metadata-staged.img")
+    defer { f.device.close() }
+    guard let virtual = f.volume.vatRef, Int(f.volume.rootICB.partition) == virtual,
+          let tag = Tag.parse(f.bytes), let id = TagID(rawValue: tag.identifier) else {
+        throw UDFError("回归样本需要有效的虚拟根目录")
+    }
+    let pending = FileEntry(addr: f.volume.rootICB, raw: f.bytes, extended: id == .extendedFileEntry)
+    pending.uniqueID += 1000
+    Tag.write(into: &pending.raw, id: id, version: tag.version, serial: tag.serial,
+              location: tag.location, length: 16 + Int(tag.crcLength))
+    f.volume.staged[f.volume.rootICB.block] = pending.raw
+    expect(try f.volume.loadFileEntry(f.volume.rootICB).uniqueID == pending.uniqueID)
+    expect(f.device.requests.isEmpty, "暂存条目不能去设备读取旧版本")
+    var corrupt = pending.raw
+    corrupt[20] ^= 1
+    f.volume.staged[f.volume.rootICB.block] = corrupt
+    expectThrows({ _ = try f.volume.loadFileEntry(f.volume.rootICB) }, "暂存损坏仍须失败，不能悄悄恢复盘上的旧条目")
+    expect(f.device.requests.isEmpty, "暂存损坏也不能绕过事务去重读盘面")
+    f.volume.staged.removeAll()
+    expect(try f.volume.loadFileEntry(f.volume.rootICB).raw == f.bytes)
 }
 
 // Return names whose unpadded FIDs put the following descriptor tag at the chosen offset.

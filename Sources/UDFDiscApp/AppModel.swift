@@ -58,6 +58,13 @@ struct Busy {
     var writes = false
 }
 
+/// Keeps a completed write distinct from a later verification or display failure.
+private struct OperationFailure: LocalizedError {
+    let title: String
+    let message: String
+    var errorDescription: String? { message }
+}
+
 @MainActor
 final class AppModel: ObservableObject {
     @Published var drives: [DriveInfo] = []
@@ -89,6 +96,7 @@ final class AppModel: ObservableObject {
     /// The UDFVolume is not thread-safe: it is only ever touched on this queue.
     private let queue = DispatchQueue(label: "udfdisc.io", qos: .userInitiated)
     private var volume: UDFVolume?
+    private var dragExportSource: DragExportSource?
     private var confirmedRealDiscWrite = false
     private var timer: Timer?
     // Auto-loading: a disc found in a drive is opened without a click, once per insertion.
@@ -171,8 +179,10 @@ final class AppModel: ObservableObject {
         }
     }
 
-    /// Runs a step with a progress sheet; errors become an alert.
+    /// Reports the operation and its follow-up refresh together, without replacing
+    /// the original failure or showing a second alert for the same operation.
     private func perform(_ title: String, total: UInt64 = 0, writes: Bool = true,
+                         refreshFailureMessage: String? = nil,
                          _ body: @escaping (UDFVolume, @escaping (UInt64) -> Void) throws -> Void) async {
         guard let vol = volume else { return }
         busy = Busy(title: title, total: total, writes: writes)
@@ -184,13 +194,32 @@ final class AppModel: ObservableObject {
             last = now
             DispatchQueue.main.async { self?.busy?.done = done }
         }
+        var operationError: Error?
+        var refreshError: Error?
         do {
             try await run { _ in try body(vol, report) }
         } catch {
-            errorMessage = error.localizedDescription
+            operationError = error
         }
-        await refresh()
+        do { try await refreshContents() } catch { refreshError = error }
         busy = nil
+        if let error = operationError {
+            let failure = error as? OperationFailure
+            var message = error.localizedDescription
+            if let refreshError {
+                message += L("\n\n目录刷新也未完成，列表可能尚未更新。", "\n\nThe folder could not be refreshed either, so the list may be out of date.")
+                if refreshError.localizedDescription != error.localizedDescription {
+                    message += "\n" + refreshError.localizedDescription
+                }
+            }
+            errorTitle = failure?.title ?? L("操作未完成", "Operation Incomplete")
+            errorMessage = message
+        } else if let error = refreshError {
+            errorTitle = L("操作已完成，目录刷新失败", "Operation Completed, Folder Refresh Failed")
+            errorMessage = (refreshFailureMessage ?? L("刚才的操作已完成，但当前目录未能重新读取。请先关闭并重新打开光盘检查结果，不要重复执行刚才的操作。",
+                                                       "The operation completed, but the current folder could not be read again. Close and reopen the disc to check the result before repeating the operation."))
+                + "\n\n" + error.localizedDescription
+        }
     }
 
     // MARK: Opening and closing
@@ -211,10 +240,16 @@ final class AppModel: ObservableObject {
         do {
             let vol = try await run { _ in try Self.makeVolume(s) }
             volume = vol
+            dragExportSource = DragExportSource()
             path = ""
-            await refresh()
+            do {
+                try await refreshContents()
+            } catch {
+                openError = L("光盘已打开，但首次读取目录失败。请关闭并重新打开光盘后再试。", "The disc opened, but its initial folder listing could not be read. Close and reopen the disc to try again.")
+                    + "\n\n" + error.localizedDescription
+            }
         } catch {
-            openError = error.localizedDescription
+            openError = L("打开光盘失败。", "Opening the disc failed.") + "\n\n" + error.localizedDescription
         }
     }
 
@@ -237,6 +272,8 @@ final class AppModel: ObservableObject {
     /// Releases the disc. For a drive this gives it back to macOS, which mounts it again.
     func close() async {
         confirmingDirectoryRepair = false
+        dragExportSource?.cancel()
+        dragExportSource = nil
         guard let vol = volume else { return }
         if let d = currentDrive { releasedAt[d.stableID] = Date() }
         volume = nil
@@ -265,6 +302,8 @@ final class AppModel: ObservableObject {
         let vol = ours ? volume : nil
         if ours {
             confirmingDirectoryRepair = false
+            dragExportSource?.cancel()
+            dragExportSource = nil
             volume = nil
             info = nil
             entries = []
@@ -305,6 +344,8 @@ final class AppModel: ObservableObject {
     }
 
     func closeSynchronously() {
+        dragExportSource?.cancel()
+        dragExportSource = nil
         guard let vol = volume else { return }
         volume = nil
         queue.sync { vol.device.close() }
@@ -328,18 +369,24 @@ final class AppModel: ObservableObject {
 
     func refresh() async {
         guard volume != nil else { return }
-        let p = path
         do {
-            let (list, i) = try await run { v -> ([UDFEntry], VolumeInfo) in
-                guard let v else { throw UDFError(L("没有打开光盘", "No disc is open")) }
-                return (try v.list(p), Self.describe(v))
-            }
-            entries = list
-            info = i
-            selection = selection.filter { id in list.contains { $0.id == id } }
+            try await refreshContents()
         } catch {
+            errorTitle = L("读取目录失败", "Folder Read Failed")
             errorMessage = error.localizedDescription
         }
+    }
+
+    /// Reads the current folder without deciding how its caller should report failure.
+    private func refreshContents() async throws {
+        let p = path
+        let (list, i) = try await run { v -> ([UDFEntry], VolumeInfo) in
+            guard let v else { throw UDFError(L("没有打开光盘", "No disc is open")) }
+            return (try v.list(p), Self.describe(v))
+        }
+        entries = list
+        info = i
+        selection = selection.filter { id in list.contains { $0.id == id } }
     }
 
     private nonisolated static func describe(_ v: UDFVolume) -> VolumeInfo {
@@ -408,15 +455,44 @@ final class AppModel: ObservableObject {
         let clashes = urls.filter { existing.contains($0.lastPathComponent.lowercased()) }
         if !clashes.isEmpty, !confirmReplace(clashes.map(\.lastPathComponent)) { return }
         let title = urls.count == 1 ? L("正在写入“\(urls[0].lastPathComponent)”…", "Writing “\(urls[0].lastPathComponent)”…") : L("正在写入 \(urls.count) 项…", "Writing \(urls.count) items…")
-        await perform(title, total: total) { v, progress in
+        await perform(title, total: total,
+                      refreshFailureMessage: L("所选项目已写入并通过校验，但目录列表刷新失败。不要重复添加；请关闭并重新打开光盘，检查已写入的项目。",
+                                               "The selected items were written and verified, but the folder list could not be refreshed. Do not add them again; close and reopen the disc to check the written items.")) { v, progress in
             var done: UInt64 = 0
-            for url in urls {
+            for (index, url) in urls.enumerated() {
                 let target = base.isEmpty ? url.lastPathComponent : base + "/" + url.lastPathComponent
                 let start = done
-                try v.add(from: url, to: target, overwrite: true) { n in progress(start + n) }
+                let remaining = urls.count - index - 1
+                var batchSummary = ""
+                if index > 0 {
+                    batchSummary += L("\n\n前 \(index) 个所选项目已写入并通过校验。", "\n\nThe preceding \(index) selected items were written and verified.")
+                }
+                if remaining > 0 {
+                    batchSummary += L("\n其余 \(remaining) 个所选项目尚未开始。", "\nThe remaining \(remaining) selected items have not been started.")
+                }
+                do {
+                    try v.add(from: url, to: target, overwrite: true) { n in progress(start + n) }
+                } catch {
+                    throw OperationFailure(title: L("写入未完成", "Write Incomplete"),
+                                           message: L("“\(url.lastPathComponent)”的写入未完成，无法确认该项目的最终状态。请重新打开光盘检查后再决定是否重试。",
+                                                      "Writing “\(url.lastPathComponent)” did not complete, so its final state is unconfirmed. Reopen the disc and check it before deciding whether to retry.")
+                                            + batchSummary + "\n\n" + error.localizedDescription)
+                }
                 done = start + Self.localSize(url)
-                guard try v.verify(target, against: url) else {
-                    throw UDFError(L("校验失败：光盘上的“\(url.lastPathComponent)”和原文件不一致", "Verification failed: “\(url.lastPathComponent)” on the disc differs from the original"))
+                let matches: Bool
+                do {
+                    matches = try v.verify(target, against: url)
+                } catch {
+                    throw OperationFailure(title: L("已写入，校验未完成", "Written, Verification Incomplete"),
+                                           message: L("“\(url.lastPathComponent)”已写入，但写后校验未能完成。不要重复添加；请关闭并重新打开光盘，再检查或导出该项目。",
+                                                      "“\(url.lastPathComponent)” was written, but verification could not finish. Do not add it again; close and reopen the disc, then check or export the item.")
+                                            + batchSummary + "\n\n" + error.localizedDescription)
+                }
+                guard matches else {
+                    throw OperationFailure(title: L("已写入，但校验不一致", "Written, Verification Mismatch"),
+                                           message: L("“\(url.lastPathComponent)”已写入，但校验发现光盘内容与本地原文件不一致。请保留原文件，重新打开光盘检查；不要直接重复添加。",
+                                                      "“\(url.lastPathComponent)” was written, but verification found differences from the local original. Keep the original and reopen the disc to investigate before adding it again.")
+                                            + batchSummary)
                 }
             }
         }
@@ -458,7 +534,7 @@ final class AppModel: ObservableObject {
     // MARK: Sorting
 
     private func resort() {
-        displayedEntries = sortKey.sorted(entries, ascending: sortAscending, kind: { $0.kindName })
+        displayedEntries = sortKey.sorted(entries, ascending: sortAscending, kind: FileKinds.kind(of:))
     }
 
     private func sortChanged() {
@@ -467,38 +543,44 @@ final class AppModel: ObservableObject {
         resort()
     }
 
-    /// The table's column-header sorting, mapped onto `sortKey` and `sortAscending`.
-    var sortOrder: [KeyPathComparator<UDFEntry>] {
-        get {
-            let order: SortOrder = sortAscending ? .forward : .reverse
-            switch sortKey {
-            case .name: return [KeyPathComparator(\UDFEntry.name, order: order)]
-            case .kind: return [KeyPathComparator(\UDFEntry.kindName, order: order)]
-            case .size: return [KeyPathComparator(\UDFEntry.size, order: order)]
-            case .date: return [KeyPathComparator(\UDFEntry.sortDate, order: order)]
-            }
-        }
-        set {
-            guard let c = newValue.first else { return }
-            let key: EntrySort
-            switch c.keyPath {
-            case \UDFEntry.kindName: key = .kind
-            case \UDFEntry.size: key = .size
-            case \UDFEntry.sortDate: key = .date
-            default: key = .name
-            }
-            if key != sortKey { sortKey = key }
-            let ascending = c.order == .forward
-            if ascending != sortAscending { sortAscending = ascending }
-        }
-    }
-
     func delete(_ items: [UDFEntry]) {
         guard canWrite, !items.isEmpty else { return }
         guardWrite { [self] in
             Task {
                 await self.perform(L("正在删除…", "Deleting…")) { v, _ in
                     for e in items { try v.remove(e.path) }
+                }
+            }
+        }
+    }
+
+    /// Creates a file-promise writer bound to this exact open volume. The returned
+    /// closure may be called on any queue; its completion is delivered on the main
+    /// actor once. Destination is the final URL allocated by Finder, not its parent.
+    func makeDragExporter(for entry: UDFEntry) -> ((URL, @escaping (Error?) -> Void) -> Void)? {
+        let checkedPath = entry.path.hasPrefix("/") ? String(entry.path.dropFirst()) : entry.path
+        guard busy == nil, let capturedVolume = volume, let capturedSource = dragExportSource,
+              !capturedSource.isCancelled, entries.contains(entry),
+              UDFVolume.isSafeExportName(entry.name),
+              checkedPath.split(separator: "/", omittingEmptySubsequences: false)
+                .allSatisfy({ UDFVolume.isSafeExportName(String($0)) }) else { return nil }
+        return { [weak self] destination, completion in
+            Task { @MainActor [weak self] in
+                guard let self, self.volume === capturedVolume,
+                      self.dragExportSource === capturedSource, !capturedSource.isCancelled else {
+                    completion(UDFError(L("原光盘已关闭或更换，请重新拖动", "The original disc was closed or changed; drag the item again")))
+                    return
+                }
+                self.queue.async {
+                    let error: Error?
+                    do {
+                        try capturedVolume.exportSafely(entry, to: destination,
+                                                        isCancelled: { capturedSource.isCancelled })
+                        error = nil
+                    } catch let failure {
+                        error = failure
+                    }
+                    DispatchQueue.main.async { completion(error) }
                 }
             }
         }
@@ -531,8 +613,13 @@ final class AppModel: ObservableObject {
     func runCheck() async {
         guard volume != nil else { return }
         busy = Busy(title: L("正在检查光盘…", "Checking the disc…"))
-        do { checkReport = try await run { v in try v!.check() } } catch { errorMessage = error.localizedDescription }
+        var checkError: Error?
+        do { checkReport = try await run { v in try v!.check() } } catch { checkError = error }
         busy = nil
+        if let error = checkError {
+            errorTitle = L("光盘检查未完成", "Disc Check Incomplete")
+            errorMessage = error.localizedDescription
+        }
     }
 
     // MARK: Sizes
