@@ -21,6 +21,7 @@ extension UDFVolume {
             b = try cache.rereadSector(try sector(addr))
             tag = entryTag(b)
         }
+        if tag == nil, let recovered = try recoverReadSession(for: addr) { return recovered }
         guard let t = tag else { throw UDFError(L("文件条目损坏：\(addr)", "File entry is damaged: \(addr)")) }
         let fe: FileEntry
         switch TagID(rawValue: t.identifier) {
@@ -68,6 +69,7 @@ extension UDFVolume {
 
     /// Streams a file's bytes in chunks.
     func readData(_ fe: FileEntry, _ sink: ([UInt8]) throws -> Void) throws {
+        try requireTrustedReadSession()
         var remaining = fe.infoLength
         if fe.adType == 3 { try sink(Array(fe.inlineData.prefix(Int(remaining)))); return }
         for e in fe.extents where remaining > 0 {
@@ -142,6 +144,9 @@ extension UDFVolume {
         let base = Self.components(path).joined(separator: "/")
         return try readFIDs(dir).filter { !$0.isDeleted && !$0.isParent }.map { f in
             let fe = try? loadFileEntry(f.icbAddr)
+            // Ordinary damaged children remain visible, but a failed identity
+            // check invalidates the entire session and must not become size=0.
+            try requireTrustedReadSession()
             let name = f.name
             return UDFEntry(name: name, path: base.isEmpty ? name : base + "/" + name,
                             isDirectory: f.isDirectory, size: fe?.infoLength ?? 0,

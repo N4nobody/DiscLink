@@ -92,6 +92,11 @@ final class AppModel: ObservableObject {
     @Published var confirmingDelete = false
     @Published var confirmingDirectoryRepair = false
     @Published var dropTargeted = false
+    @Published private(set) var preparingImport = false
+    @Published private(set) var importConflict: DiscImportConflict?
+    @Published var applyChoiceToRemainder = false
+    private var conflictResponse: CheckedContinuation<DiscImportChoice, Never>?
+    private var importChoices: [DiscImportConflict.Kind: DiscImportChoice] = [:]
 
     /// The UDFVolume is not thread-safe: it is only ever touched on this queue.
     private let queue = DispatchQueue(label: "udfdisc.io", qos: .userInitiated)
@@ -121,7 +126,7 @@ final class AppModel: ObservableObject {
         }
     }
 
-    var canWrite: Bool { info != nil && info?.readOnlyReason == nil && busy == nil }
+    var canWrite: Bool { info != nil && info?.readOnlyReason == nil && busy == nil && !preparingImport && pendingWrite == nil }
     var canRepairDirectory: Bool { canWrite && info?.isWriteOnce == true }
     var pathComponents: [String] { path.split(separator: "/").map(String.init) }
 
@@ -159,7 +164,7 @@ final class AppModel: ObservableObject {
 
     /// Opens a newly inserted disc (or the one present at launch) without a click.
     private func autoOpenIfNeeded() {
-        guard launched, busy == nil else { return }
+        guard launched, busy == nil, !preparingImport else { return }
         if volume != nil, currentDrive != nil { return }          // already showing a disc
         guard let d = drives.first(where: { !$0.bsdName.isEmpty && !noAutoOpen.contains($0.stableID) }) else { return }
         // A disc that just went in is still being mounted by macOS; give it a moment.
@@ -174,9 +179,17 @@ final class AppModel: ObservableObject {
 
     private func run<T>(_ body: @escaping (UDFVolume?) throws -> T) async throws -> T {
         let vol = volume
-        return try await withCheckedThrowingContinuation { c in
-            queue.async { c.resume(with: Result { try body(vol) }) }
+        let (result, reason): (Result<T, Error>, String?) = await withCheckedContinuation { c in
+            queue.async {
+                let result = Result { try body(vol) }
+                c.resume(returning: (result, vol?.readOnlyReason))
+            }
         }
+        // A failed read can revoke write access before we can refresh the list.
+        if let vol, volume === vol, let reason, info?.readOnlyReason != reason {
+            info?.readOnlyReason = reason
+        }
+        return try result.get()
     }
 
     /// Reports the operation and its follow-up refresh together, without replacing
@@ -271,6 +284,8 @@ final class AppModel: ObservableObject {
 
     /// Releases the disc. For a drive this gives it back to macOS, which mounts it again.
     func close() async {
+        pendingWrite = nil
+        answerImportConflict(.cancel)
         confirmingDirectoryRepair = false
         dragExportSource?.cancel()
         dragExportSource = nil
@@ -295,7 +310,7 @@ final class AppModel: ObservableObject {
     /// Ejects the disc (or opens an empty tray). A drive we hold is ejected through our own
     /// connection and then released; any other drive is ejected the way the Finder does it.
     func eject(_ drive: DriveInfo) async {
-        guard busy == nil else { return }
+        guard busy == nil, !preparingImport else { return }
         busy = Busy(title: L("正在推出光盘…", "Ejecting the disc…"))
         defer { busy = nil }
         let ours = currentDrive?.stableID == drive.stableID
@@ -442,27 +457,68 @@ final class AppModel: ObservableObject {
     }
 
     func add(_ urls: [URL]) {
-        guard canWrite, !urls.isEmpty else { return }
+        guard canWrite, !urls.isEmpty, let destination = volume else { return }
+        let folder = path
         guardWrite { [self] in
-            Task { await self.performAdd(urls) }
+            guard canWrite, volume === destination, path == folder else { return }
+            preparingImport = true
+            Task { await performAdd(urls, into: folder, on: destination) }
         }
     }
 
-    private func performAdd(_ urls: [URL]) async {
-        let base = path
-        let total = urls.reduce(UInt64(0)) { $0 + Self.localSize($1) }
-        let existing = Set(entries.map { $0.name.lowercased() })
-        let clashes = urls.filter { existing.contains($0.lastPathComponent.lowercased()) }
-        if !clashes.isEmpty, !confirmReplace(clashes.map(\.lastPathComponent)) { return }
-        let title = urls.count == 1 ? L("正在写入“\(urls[0].lastPathComponent)”…", "Writing “\(urls[0].lastPathComponent)”…") : L("正在写入 \(urls.count) 项…", "Writing \(urls.count) items…")
+    private func chooseImportAction(_ conflict: DiscImportConflict) async -> DiscImportChoice {
+        if let remembered = importChoices[conflict.kind] { return remembered }
+        return await withCheckedContinuation { response in
+            conflictResponse = response
+            applyChoiceToRemainder = false
+            importConflict = conflict
+        }
+    }
+
+    func answerImportConflict(_ choice: DiscImportChoice) {
+        guard let response = conflictResponse, let conflict = importConflict else { return }
+        if applyChoiceToRemainder && choice != .cancel { importChoices[conflict.kind] = choice }
+        conflictResponse = nil
+        importConflict = nil
+        response.resume(returning: choice)
+    }
+
+    private func performAdd(_ urls: [URL], into folder: String, on destination: UDFVolume) async {
+        defer {
+            preparingImport = false
+            importChoices.removeAll()
+        }
+        let groups: [DiscImportGroup]
+        do {
+            let plan = try await DiscImportPlanner.plan(urls, into: folder, list: { path in
+                try await self.run { vol in
+                    guard vol === destination else { throw UDFError(L("目标光盘已更换", "The destination disc has changed")) }
+                    return try destination.list(path)
+                }
+            }, decide: { conflict in
+                guard self.volume === destination, self.path == folder else { return .cancel }
+                return await self.chooseImportAction(conflict)
+            })
+            guard let plan, !plan.isEmpty, volume === destination, path == folder else { return }
+            groups = plan
+        } catch {
+            errorTitle = L("无法准备添加文件", "Could Not Prepare the Import")
+            errorMessage = error.localizedDescription
+            return
+        }
+        let total = groups.reduce(UInt64(0)) { $0 + $1.byteCount }
+        let title = groups.count == 1
+            ? L("正在写入“\((groups[0].target as NSString).lastPathComponent)”…", "Writing “\((groups[0].target as NSString).lastPathComponent)”…")
+            : L("正在写入 \(groups.count) 项…", "Writing \(groups.count) items…")
         await perform(title, total: total,
                       refreshFailureMessage: L("所选项目已写入并通过校验，但目录列表刷新失败。不要重复添加；请关闭并重新打开光盘，检查已写入的项目。",
                                                "The selected items were written and verified, but the folder list could not be refreshed. Do not add them again; close and reopen the disc to check the written items.")) { v, progress in
+            try DiscImportPlanner.validateSources(groups)
             var done: UInt64 = 0
-            for (index, url) in urls.enumerated() {
-                let target = base.isEmpty ? url.lastPathComponent : base + "/" + url.lastPathComponent
+            for (index, group) in groups.enumerated() {
+                let name = (group.target as NSString).lastPathComponent
                 let start = done
-                let remaining = urls.count - index - 1
+                let remaining = groups.count - index - 1
                 var batchSummary = ""
                 if index > 0 {
                     batchSummary += L("\n\n前 \(index) 个所选项目已写入并通过校验。", "\n\nThe preceding \(index) selected items were written and verified.")
@@ -471,42 +527,31 @@ final class AppModel: ObservableObject {
                     batchSummary += L("\n其余 \(remaining) 个所选项目尚未开始。", "\nThe remaining \(remaining) selected items have not been started.")
                 }
                 do {
-                    try v.add(from: url, to: target, overwrite: true) { n in progress(start + n) }
+                    try v.applyImport(group) { n in progress(start + n) }
                 } catch {
                     throw OperationFailure(title: L("写入未完成", "Write Incomplete"),
-                                           message: L("“\(url.lastPathComponent)”的写入未完成，无法确认该项目的最终状态。请重新打开光盘检查后再决定是否重试。",
-                                                      "Writing “\(url.lastPathComponent)” did not complete, so its final state is unconfirmed. Reopen the disc and check it before deciding whether to retry.")
+                                           message: L("“\(name)”的写入未完成，无法确认该项目的最终状态。请重新打开光盘检查后再决定是否重试。",
+                                                      "Writing “\(name)” did not complete, so its final state is unconfirmed. Reopen the disc and check it before deciding whether to retry.")
                                             + batchSummary + "\n\n" + error.localizedDescription)
                 }
-                done = start + Self.localSize(url)
+                done = start + group.byteCount
                 let matches: Bool
                 do {
-                    matches = try v.verify(target, against: url)
+                    matches = try v.verifyImport(group)
                 } catch {
                     throw OperationFailure(title: L("已写入，校验未完成", "Written, Verification Incomplete"),
-                                           message: L("“\(url.lastPathComponent)”已写入，但写后校验未能完成。不要重复添加；请关闭并重新打开光盘，再检查或导出该项目。",
-                                                      "“\(url.lastPathComponent)” was written, but verification could not finish. Do not add it again; close and reopen the disc, then check or export the item.")
+                                           message: L("“\(name)”已写入，但写后校验未能完成。不要重复添加；请关闭并重新打开光盘，再检查或导出该项目。",
+                                                      "“\(name)” was written, but verification could not finish. Do not add it again; close and reopen the disc, then check or export the item.")
                                             + batchSummary + "\n\n" + error.localizedDescription)
                 }
                 guard matches else {
                     throw OperationFailure(title: L("已写入，但校验不一致", "Written, Verification Mismatch"),
-                                           message: L("“\(url.lastPathComponent)”已写入，但校验发现光盘内容与本地原文件不一致。请保留原文件，重新打开光盘检查；不要直接重复添加。",
-                                                      "“\(url.lastPathComponent)” was written, but verification found differences from the local original. Keep the original and reopen the disc to investigate before adding it again.")
+                                           message: L("“\(name)”已写入，但校验发现光盘内容与本地原文件不一致。请保留原文件，重新打开光盘检查；不要直接重复添加。",
+                                                      "“\(name)” was written, but verification found differences from the local original. Keep the original and reopen the disc to investigate before adding it again.")
                                             + batchSummary)
                 }
             }
         }
-    }
-
-    private func confirmReplace(_ names: [String]) -> Bool {
-        let alert = NSAlert()
-        alert.messageText = names.count == 1 ? L("“\(names[0])”已经存在，要替换吗？", "“\(names[0])” already exists. Replace it?") : L("有 \(names.count) 项已经存在，要替换吗？", "\(names.count) items already exist. Replace them?")
-        alert.informativeText = info?.isWriteOnce == true
-            ? L("一次性写入盘上的旧版本不会被擦掉，只是不再显示，占用的空间也不会释放。", "On a write-once disc the old version isn't erased, only hidden, and its space isn't freed.")
-            : L("光盘上的旧版本会被删除。", "The old version on the disc will be deleted.")
-        alert.addButton(withTitle: L("替换", "Replace"))
-        alert.addButton(withTitle: L("取消", "Cancel"))
-        return alert.runModal() == .alertFirstButtonReturn
     }
 
     func makeFolder(named name: String) {
@@ -623,22 +668,6 @@ final class AppModel: ObservableObject {
     }
 
     // MARK: Sizes
-
-    private nonisolated static func localSize(_ url: URL) -> UInt64 {
-        var isDir: ObjCBool = false
-        guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir) else { return 0 }
-        if !isDir.boolValue {
-            return (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize).flatMap { $0 }.map(UInt64.init) ?? 0
-        }
-        var total: UInt64 = 0
-        let e = FileManager.default.enumerator(at: url, includingPropertiesForKeys: [.fileSizeKey, .isRegularFileKey])
-        while let f = e?.nextObject() as? URL {
-            if let v = try? f.resourceValues(forKeys: [.fileSizeKey, .isRegularFileKey]), v.isRegularFile == true {
-                total += UInt64(v.fileSize ?? 0)
-            }
-        }
-        return total
-    }
 
     private nonisolated static func discSize(_ e: UDFEntry, in v: UDFVolume) throws -> UInt64 {
         guard e.isDirectory else { return e.size }

@@ -28,11 +28,16 @@ public final class UDFVolume {
     /// Virtual blocks written in the current transaction, appended at commit.
     var staged: [UInt32: [UInt8]] = [:]
     var nextUnique: UInt64 = 16
+    var transactionInProgress = false
+    var mediumDescriptors: [[UInt8]] = []
+    var committedReadState: CommittedReadState?
+    var readSessionRecoveryAttempted = false
+    var readSessionFailure: String?
 
     /// True for CD-R/DVD-R style volumes that map blocks through a VAT.
     public var isWriteOnce: Bool { vatRef != nil }
 
-    public var readOnlyReason: String? { device.readOnlyReason ?? writeBlocker }
+    public var readOnlyReason: String? { readSessionFailure ?? device.readOnlyReason ?? writeBlocker }
 
     public static func open(_ device: SectorDevice) throws -> UDFVolume {
         let v = UDFVolume(cache: PacketCache(device))
@@ -47,7 +52,10 @@ public final class UDFVolume {
 
     // MARK: Sector / block I/O
 
-    func readSectors(_ s: UInt32, _ n: Int) throws -> [UInt8] { try cache.read(s, count: n) }
+    func readSectors(_ s: UInt32, _ n: Int) throws -> [UInt8] {
+        try requireTrustedReadSession()
+        return try cache.read(s, count: n)
+    }
 
     func sector(_ a: LBAddr) throws -> UInt32 {
         guard Int(a.partition) < maps.count else { throw UDFError(L("分区引用无效：\(a)", "Invalid partition reference: \(a)")) }
@@ -79,6 +87,7 @@ public final class UDFVolume {
 
     /// Reads `count` logical blocks, splitting where the mapping is not contiguous.
     func readBlocks(_ a: LBAddr, _ count: Int) throws -> [UInt8] {
+        try requireTrustedReadSession()
         if let v = vatRef, Int(a.partition) == v {
             var out = [UInt8]()
             for i in 0 ..< count {
@@ -104,6 +113,7 @@ public final class UDFVolume {
     /// Writes whole logical blocks. Metadata always goes through the packet cache so a failed
     /// transaction leaves the disc untouched; file data may bypass it.
     func writeBlocks(_ a: LBAddr, _ data: [UInt8], metadata: Bool = true) throws {
+        try requireTrustedReadSession()
         precondition(data.count % blockSize == 0)
         let count = data.count / blockSize
         if let v = vatRef {
@@ -238,6 +248,10 @@ public final class UDFVolume {
         guard let ft = Tag.parse(fsd), ft.identifier == TagID.fileSet.rawValue else { throw UDFError(L("文件集描述符损坏", "The file set descriptor is damaged")) }
         tagVersion = ft.version
         rootICB = LBAddr.parse(fsd, 404)
+        // These descriptors are immutable during our VAT appends. Unlike a volume
+        // name alone they identify the mounted layout as well as its file set.
+        mediumDescriptors = [avdp] + (vds.pvd.map { [$0] } ?? []) + [lvd]
+            + vds.pds.keys.sorted().compactMap { vds.pds[$0] } + [fsd]
 
         // Writability checks.
         if vatRef != nil, writeBlocker == nil {

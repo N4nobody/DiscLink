@@ -26,6 +26,7 @@ public final class OpticalDrive: SectorDevice {
     public private(set) var packetSectors = 1
     public private(set) var packetBase: UInt32 = 0
     public private(set) var profileName = ""
+    private var mediaProfile: UInt16 = 0
     public private(set) var isSequential = false
     public private(set) var appendAlignment = 1
     private var lastTrack: UInt16 = 1
@@ -55,6 +56,11 @@ public final class OpticalDrive: SectorDevice {
     public init(_ info: DriveInfo, allowWrite: Bool) throws {
         self.info = info
         label = info.displayName
+        try acquire(info)
+        do { try probe(allowWrite: allowWrite) } catch { close(); throw error }
+    }
+
+    private func acquire(_ info: DriveInfo) throws {
         // Right after a disc goes in, macOS may mount it again between our unmount and taking
         // exclusive access ("busy"). Unmount again and retry for a few seconds.
         var attempt = 0
@@ -68,7 +74,6 @@ public final class OpticalDrive: SectorDevice {
                 Thread.sleep(forTimeInterval: 1)
             }
         }
-        do { try probe(allowWrite: allowWrite) } catch { close(); throw error }
     }
 
     deinit { close() }
@@ -207,6 +212,7 @@ public final class OpticalDrive: SectorDevice {
         _ = try execRetrying([0x00, 0, 0, 0, 0, 0])                       // TEST UNIT READY
         let conf = try execRetrying([0x46, 0x01, 0, 0, 0, 0, 0, 0, 16, 0], in: 16)   // GET CONFIGURATION
         let profile = conf.be16(6)
+        mediaProfile = profile
         profileName = Self.profileNames[profile] ?? String(format: L("未知盘型 0x%04X", "Unknown disc type 0x%04X"), profile)
 
         let cap = try execRetrying([0x25, 0, 0, 0, 0, 0, 0, 0, 0, 0], in: 8)  // READ CAPACITY
@@ -382,5 +388,49 @@ public final class OpticalDrive: SectorDevice {
 
     public func synchronize() throws {
         _ = try execRetrying([0x35, 0, 0, 0, 0, 0, 0, 0, 0, 0], timeout: 300_000)
+    }
+}
+
+extension OpticalDrive: RenewableReadSession {
+    func renewReadSession(validating validate: () throws -> Void) throws {
+        let previousProfile = mediaProfile
+        guard handle != nil, Self.writeOnceProfiles.contains(previousProfile) else {
+            throw UDFError(L("当前光驱连接无法重新读取这张盘", "This drive connection cannot be renewed for this disc"))
+        }
+        let resumeAppending = isSequential && readOnlyReason == nil
+        close()
+        isSequential = false
+        readOnlyReason = L("正在重新确认光盘", "Rechecking the disc")
+        lastTrack = 1
+        discStatus = 0xFF
+        trackSummary = nil
+        do {
+            // Releasing exclusive access replaces the service and macOS rediscovers
+            // the medium. Use this drive's new BSD node and service, never an old ID.
+            let deadline = ProcessInfo.processInfo.systemUptime + 15
+            var medium: DriveInfo?
+            repeat {
+                medium = Self.list().first { $0.stableID == info.stableID && !$0.bsdName.isEmpty }
+                if medium == nil { Thread.sleep(forTimeInterval: 0.2) }
+            } while medium == nil && ProcessInfo.processInfo.systemUptime < deadline
+            guard let medium else {
+                throw UDFError(L("等待原光驱重新识别光盘超时", "Timed out waiting for the original drive to rediscover the disc"))
+            }
+            try acquire(medium)
+            try probe(allowWrite: false)
+            guard mediaProfile == previousProfile, trackSummary != nil else {
+                throw UDFError(L("重新连接后的盘型或轨道信息与原光盘不符", "The media type or track information could not be confirmed after reconnecting"))
+            }
+            try validate()
+            if resumeAppending {
+                readOnlyReason = nil
+                try prepareAppend(profile: mediaProfile)
+            }
+        } catch {
+            close()
+            isSequential = false
+            readOnlyReason = L("无法确认光盘，请关闭后重新打开再检查", "The disc could not be confirmed. Close and reopen it to check.")
+            throw error
+        }
     }
 }

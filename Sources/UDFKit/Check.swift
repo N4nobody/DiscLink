@@ -76,6 +76,7 @@ extension UDFVolume {
                 visited.insert(f.icbAddr)
                 let fe: FileEntry
                 do { fe = try loadFileEntry(f.icbAddr) } catch {
+                    try requireTrustedReadSession()
                     report.problems.append("\(p)：\(error.localizedDescription)"); continue
                 }
                 if fe.isDirectory != f.isDirectory { report.problems.append(L("\(p)：目录标记和文件类型不一致", "\(p): the folder flag doesn't match the file type")) }

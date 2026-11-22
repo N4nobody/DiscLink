@@ -9,6 +9,9 @@ extension UDFVolume {
 
     func transaction(_ body: () throws -> Void) throws {
         if let r = readOnlyReason { throw UDFError(L("无法写入：\(r)", "Can't write: \(r)")) }
+        guard !transactionInProgress else { throw UDFError(L("写入操作尚未完成", "A write operation is already in progress")) }
+        transactionInProgress = true
+        defer { transactionInProgress = false }
         if vatRef != nil { try vatTransaction(body); return }
         guard let bm = bitmap else { throw UDFError(L("无法写入：没有空间位图", "Can't write: there is no space bitmap")) }
         let savedBitmap = bm.raw
@@ -412,7 +415,7 @@ extension UDFVolume {
                    nameRaw: raw)
     }
 
-    private static func validate(_ name: String) throws {
+    static func validateFilename(_ name: String) throws {
         guard !name.isEmpty, name != ".", name != "..", !name.contains("/"), !name.contains("\0") else {
             throw UDFError(L("文件名无效：\(name)", "Invalid file name: \(name)"))
         }
@@ -421,7 +424,7 @@ extension UDFVolume {
     private func parentAndName(_ path: String) throws -> (FileEntry, String, String) {
         var comps = Self.components(path)
         guard let name = comps.popLast() else { throw UDFError(L("路径无效：\(path)", "Invalid path: \(path)")) }
-        try Self.validate(name)
+        try Self.validateFilename(name)
         let parentPath = comps.joined(separator: "/")
         let parent = try resolve(parentPath).fe
         guard parent.isDirectory else { throw UDFError(L("不是文件夹：\(parentPath)", "Not a folder: \(parentPath)")) }
@@ -506,14 +509,16 @@ extension UDFVolume {
 
     /// Creates a folder. Intermediate folders must exist.
     public func makeDirectory(_ path: String) throws {
-        try transaction {
-            let (parent, name, _) = try parentAndName(path)
-            var fids = try readFIDs(parent)
-            if fids.contains(where: { !$0.isDeleted && !$0.isParent && $0.name.caseInsensitiveCompare(name) == .orderedSame }) {
-                throw UDFError(L("已经存在：\(name)", "Already exists: \(name)"))
-            }
-            try addDirectory(name: name, parent: parent, fids: &fids, now: Date())
+        try transaction { try makeDirectoryInTransaction(path) }
+    }
+
+    private func makeDirectoryInTransaction(_ path: String) throws {
+        let (parent, name, _) = try parentAndName(path)
+        var fids = try readFIDs(parent)
+        if fids.contains(where: { !$0.isDeleted && !$0.isParent && $0.name.caseInsensitiveCompare(name) == .orderedSame }) {
+            throw UDFError(L("已经存在：\(name)", "Already exists: \(name)"))
         }
+        try addDirectory(name: name, parent: parent, fids: &fids, now: Date())
     }
 
     @discardableResult
@@ -543,7 +548,23 @@ extension UDFVolume {
         }
     }
 
-    private func addItem(from source: URL, to path: String, overwrite: Bool, progress: (UInt64) -> Void) throws {
+    /// Commit one selected top-level item, including its planned descendants, in one transaction.
+    public func applyImport(_ group: DiscImportGroup, progress: ((UInt64) -> Void)? = nil) throws {
+        try group.validateSources()
+        try transaction {
+            var done: UInt64 = 0
+            for step in group.steps {
+                if step.directory { try makeDirectoryInTransaction(step.path) }
+                else {
+                    try addItem(from: step.source, to: step.path, overwrite: step.overwrite, plannedFile: true) {
+                        done += $0; progress?(done)
+                    }
+                }
+            }
+        }
+    }
+
+    private func addItem(from source: URL, to path: String, overwrite: Bool, plannedFile: Bool = false, progress: (UInt64) -> Void) throws {
         var isDir: ObjCBool = false
         guard FileManager.default.fileExists(atPath: source.path, isDirectory: &isDir) else {
             throw UDFError(L("找不到本地文件：\(source.path)", "Local file not found: \(source.path)"))
@@ -551,7 +572,14 @@ extension UDFVolume {
         let (parent, name, _) = try parentAndName(path)
         var fids = try readFIDs(parent)
         let now = Date()
-        if let i = fids.firstIndex(where: { !$0.isDeleted && !$0.isParent && $0.name.caseInsensitiveCompare(name) == .orderedSame }) {
+        let index = fids.firstIndex { !$0.isDeleted && !$0.isParent && $0.name.caseInsensitiveCompare(name) == .orderedSame }
+        if plannedFile {
+            guard !isDir.boolValue, (index != nil) == overwrite,
+                  index.map({ !fids[$0].isDirectory }) ?? true else {
+                throw UDFError(L("源文件或目标已发生变化：\(path)", "The source file or destination has changed: \(path)"))
+            }
+        }
+        if let i = index {
             let existing = fids[i]
             if isDir.boolValue && existing.isDirectory {
                 // Merge into the existing folder.
@@ -567,7 +595,7 @@ extension UDFVolume {
             try addContents(of: source, into: path, overwrite: overwrite, progress: progress)
             return
         }
-        let fe = try writeNewFile(from: source, near: parent.addr.block, now: now, progress: progress)
+        let fe = try writeNewFile(from: source, near: parent.addr.block, now: now, plannedFile: plannedFile, progress: progress)
         fids = fids.filter { !$0.isDeleted }
         fids.append(try childFID(name: name, fe: fe, directory: false))
         try writeDirectory(parent, fids, now: now)
@@ -581,11 +609,26 @@ extension UDFVolume {
         }
     }
 
-    private func writeNewFile(from source: URL, near: UInt32, now: Date, progress: (UInt64) -> Void) throws -> FileEntry {
+    private func writeNewFile(from source: URL, near: UInt32, now: Date, plannedFile: Bool, progress: (UInt64) -> Void) throws -> FileEntry {
         let attrs = try FileManager.default.attributesOfItem(atPath: source.path)
         let size = (attrs[.size] as? NSNumber)?.uint64Value ?? 0
         let mtime = attrs[.modificationDate] as? Date
-        guard let h = FileHandle(forReadingAtPath: source.path) else { throw UDFError(L("无法读取：\(source.path)", "Can't read: \(source.path)")) }
+        let h: FileHandle
+        if plannedFile {
+            // Refuse a link or a named pipe swapped in since planning; regular files ignore O_NONBLOCK.
+            let fd = Darwin.open(source.path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
+            guard fd >= 0 else { throw UDFError(L("无法读取：\(source.path)", "Can't read: \(source.path)")) }
+            h = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
+            var stat = Darwin.stat()
+            guard fstat(fd, &stat) == 0, stat.st_mode & S_IFMT == S_IFREG, stat.st_size == size else {
+                throw UDFError(L("源文件已发生变化：\(source.path)", "The source file has changed: \(source.path)"))
+            }
+        } else {
+            guard let handle = FileHandle(forReadingAtPath: source.path) else {
+                throw UDFError(L("无法读取：\(source.path)", "Can't read: \(source.path)"))
+            }
+            h = handle
+        }
         defer { try? h.close() }
 
         let icb = try allocate(1, near: near)[0].location

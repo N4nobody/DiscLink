@@ -91,6 +91,9 @@ extension UDFVolume {
         guard runs.count == 1, runs[0].start == nwa else { throw UDFError(L("VAT 没有写在预期位置（光驱报告的地址变了）", "The VAT didn't land where expected (the drive reported a different address)")) }
         try device.synchronize()
         vatICBSector = at
+        committedReadState = CommittedReadState(vatSector: at, recordedTail: device.lastRecordedSector,
+                                               entries: vat, header: header, entry: fe.raw)
+        readSessionRecoveryAttempted = false
     }
 
     /// Records the current VAT again at the end of the disc (aligned as above), without

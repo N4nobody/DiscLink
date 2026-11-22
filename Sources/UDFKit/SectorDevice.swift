@@ -41,6 +41,13 @@ public extension SectorDevice {
     var appendAlignment: Int { 1 }
 }
 
+/// A device that can replace an unreliable read session without changing the medium.
+/// Validation runs with writes disabled; only successful validation may restore the
+/// previous write configuration. A failure must leave the device closed or read-only.
+protocol RenewableReadSession: SectorDevice {
+    func renewReadSession(validating: () throws -> Void) throws
+}
+
 // MARK: - Disc image file
 
 /// A raw sector image (.iso/.img/.udf). Can pretend to be packet-written media so the
@@ -156,6 +163,8 @@ public final class PacketCache {
     private var cleanOrder: [UInt32] = []
     private var badUnits = Set<UInt32>()
     private let cleanLimit = 256
+
+    var hasPendingWrites: Bool { !dirty.isEmpty }
 
     public init(_ device: SectorDevice) {
         self.device = device
@@ -336,6 +345,11 @@ public final class PacketCache {
     /// Drops unwritten changes (used after a failed transaction) and the read cache.
     public func discard() {
         dirty.removeAll()
+        discardReadCache()
+    }
+
+    /// Invalidates observations from a previous device session without losing writes.
+    func discardReadCache() {
         badUnits.removeAll()
         clean.removeAll()
         cleanOrder.removeAll()

@@ -33,11 +33,11 @@ struct DiscFileTable: NSViewRepresentable {
         table.target = coordinator
         table.doubleAction = #selector(Coordinator.openClickedRow(_:))
         table.buildMenu = { [weak coordinator] in coordinator?.contextMenu() }
-        table.registerForDraggedTypes([.fileURL])
-        table.didLeaveDropTarget = { [weak model] in model?.dropTargeted = false }
         table.setDraggingSourceOperationMask(.copy, forLocal: false)
         table.setDraggingSourceOperationMask([], forLocal: true)
-        let scroll = NSScrollView()
+        let scroll = FileImportScrollView()
+        scroll.model = model
+        scroll.registerForDraggedTypes([.fileURL, FileImportScrollView.finderFileList])
         scroll.hasVerticalScroller = true
         scroll.hasHorizontalScroller = true
         scroll.autohidesScrollers = true
@@ -123,26 +123,6 @@ struct DiscFileTable: NSViewRepresentable {
             return DiscFilePromise(name: entry.name, fileType: type.identifier, export: export)
         }
 
-        func tableView(_ tableView: NSTableView, validateDrop info: NSDraggingInfo,
-                       proposedRow row: Int, proposedDropOperation operation: NSTableView.DropOperation) -> NSDragOperation {
-            let external = (info.draggingSource as? NSTableView) !== tableView
-            let allowed = model.canWrite && external && info.draggingPasteboard.canReadObject(
-                forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true])
-            if model.dropTargeted != allowed { model.dropTargeted = allowed }
-            if allowed { tableView.setDropRow(-1, dropOperation: .on) }
-            return allowed ? .copy : []
-        }
-
-        func tableView(_ tableView: NSTableView, acceptDrop info: NSDraggingInfo, row: Int,
-                       dropOperation: NSTableView.DropOperation) -> Bool {
-            model.dropTargeted = false
-            guard model.canWrite, (info.draggingSource as? NSTableView) !== tableView,
-                  let urls = info.draggingPasteboard.readObjects(forClasses: [NSURL.self],
-                       options: [.urlReadingFileURLsOnly: true]) as? [URL], !urls.isEmpty else { return false }
-            model.add(urls)
-            return true
-        }
-
         @objc func openClickedRow(_ table: NSTableView) {
             guard rows.indices.contains(table.clickedRow) else { return }
             openSelection()
@@ -176,18 +156,47 @@ struct DiscFileTable: NSViewRepresentable {
     }
 }
 
+/// Import belongs to the current directory, including the blank area below the
+/// last row. The table only starts exports; the enclosing scroll view receives imports.
+private final class FileImportScrollView: NSScrollView {
+    static let finderFileList = NSPasteboard.PasteboardType("NSFilenamesPboardType")
+    weak var model: AppModel?
+
+    private func canImport(_ sender: NSDraggingInfo) -> Bool {
+        guard model?.canWrite == true, (sender.draggingSource as? NSTableView) !== documentView else { return false }
+        return sender.draggingPasteboard.availableType(from: [.fileURL, Self.finderFileList]) != nil
+    }
+
+    override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
+        let allowed = canImport(sender)
+        if model?.dropTargeted != allowed { model?.dropTargeted = allowed }
+        return allowed ? .copy : []
+    }
+    override func draggingUpdated(_ sender: NSDraggingInfo) -> NSDragOperation { draggingEntered(sender) }
+    override func draggingExited(_ sender: NSDraggingInfo?) { model?.dropTargeted = false }
+    override func prepareForDragOperation(_ sender: NSDraggingInfo) -> Bool { canImport(sender) }
+
+    override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
+        defer { model?.dropTargeted = false }
+        guard canImport(sender), let model else { return false }
+        let pasteboard = sender.draggingPasteboard
+        let items = pasteboard.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) ?? []
+        var files = items.compactMap { ($0 as? NSURL)?.filePathURL }
+        if files.isEmpty, let paths = pasteboard.propertyList(forType: Self.finderFileList) as? [String] {
+            files = paths.filter { $0.hasPrefix("/") }.map { URL(fileURLWithPath: $0) }
+        }
+        guard !files.isEmpty else { return false }
+        model.add(files)
+        return true
+    }
+
+    override func draggingEnded(_ sender: NSDraggingInfo) {
+        model?.dropTargeted = false
+    }
+}
+
 private final class FileList: NSTableView {
     var buildMenu: (() -> NSMenu?)?
-    var didLeaveDropTarget: (() -> Void)?
-
-    override func draggingExited(_ sender: NSDraggingInfo?) {
-        super.draggingExited(sender)
-        didLeaveDropTarget?()
-    }
-    override func draggingEnded(_ sender: NSDraggingInfo) {
-        super.draggingEnded(sender)
-        didLeaveDropTarget?()
-    }
 
     override func menu(for event: NSEvent) -> NSMenu? {
         let index = row(at: convert(event.locationInWindow, from: nil))

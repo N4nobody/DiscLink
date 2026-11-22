@@ -358,11 +358,11 @@ test("整卷：写入失败后光盘保持原样") {
 
 // These tests use only disposable image files. They intentionally reproduce the 2036-byte
 // directory boundary that made a DVD-R unreadable to Windows despite passing our checker.
-func writeOnceImage(_ name: String) throws -> URL {
+func writeOnceImage(_ name: String, volumeName: String = "DIRTEST") throws -> URL {
     let url = blankFile(name, sectors: 32_768)
     let p = Process(), output = Pipe()
     p.executableURL = URL(fileURLWithPath: "/sbin/newfs_udf")
-    p.arguments = ["-b", "2048", "-r", "2.01", "-m", "blk", "-t", "wo", "-v", "DIRTEST", url.path]
+    p.arguments = ["-b", "2048", "-r", "2.01", "-m", "blk", "-t", "wo", "-v", volumeName, url.path]
     p.standardOutput = output; p.standardError = output
     try p.run()
     let text = String(decoding: output.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
@@ -445,6 +445,223 @@ test("文件条目：VAT 暂存优先，不能用盘上旧的有效条目掩盖�
     expect(f.device.requests.isEmpty, "暂存损坏也不能绕过事务去重读盘面")
     f.volume.staged.removeAll()
     expect(try f.volume.loadFileEntry(f.volume.rootICB).raw == f.bytes)
+}
+
+// MARK: - Renewing a stale write-once read session
+
+// Writes always reach a regular image correctly. Only the old session's view of
+// one newly written sector is stale, even for single-sector reads. Reopening the
+// session restores the real bytes, or exposes a different/older disc view for the
+// negative cases. No test opens an optical device or changes the image's FE bytes.
+final class RenewableSessionImage: RenewableReadSession {
+    let original: ImageDevice
+    private var active: ImageDevice
+    private var gate: String?
+    private var staleSector: UInt32?
+    private var stale = false
+    private var advertisedLastRecorded: UInt32?
+    var imageAfterRenewal: ImageDevice?
+    var lastRecordedAfterRenewal: UInt32?
+    var remainsInvalidAfterRenewal = false
+    private(set) var renewals = 0
+    private(set) var writes = 0
+    private(set) var staleSingleReads = 0
+    private(set) var validatedWhileReadOnly = false
+
+    init(_ image: ImageDevice) { original = image; active = image }
+    var label: String { active.label }
+    var sectorSize: Int { active.sectorSize }
+    var sectorCount: UInt32 { active.sectorCount }
+    var readOnlyReason: String? { gate ?? active.readOnlyReason }
+    var packetSectors: Int { active.packetSectors }
+    var packetBase: UInt32 { active.packetBase }
+    var isSequential: Bool { gate == nil && active.isSequential }
+    var lastRecordedSector: UInt32 { advertisedLastRecorded ?? active.lastRecordedSector }
+    var appendableSectors: UInt32 { active.appendableSectors }
+    var appendAlignment: Int { active.appendAlignment }
+    func nextWritableAddress() throws -> UInt32 { try active.nextWritableAddress() }
+
+    func makeCurrentSessionStale(at sector: UInt32) {
+        staleSector = sector
+        stale = true
+    }
+
+    func readSectors(_ lba: UInt32, count: Int) throws -> [UInt8] {
+        var bytes = try active.readSectors(lba, count: count)
+        if stale, let sector = staleSector, lba <= sector, sector < lba + UInt32(count) {
+            let offset = Int(sector - lba) * sectorSize
+            bytes.replaceSubrange(offset ..< offset + sectorSize, with: [UInt8](repeating: 0, count: sectorSize))
+            if count == 1 { staleSingleReads += 1 }
+        }
+        return bytes
+    }
+
+    func writeSectors(_ lba: UInt32, _ data: [UInt8]) throws {
+        if let reason = readOnlyReason { throw UDFError(reason) }
+        writes += 1
+        try active.writeSectors(lba, data)
+    }
+    func synchronize() throws { try active.synchronize() }
+
+    func renewReadSession(validating: () throws -> Void) throws {
+        renewals += 1
+        gate = "Session must be validated before writes resume"
+        if let replacement = imageAfterRenewal { active = replacement }
+        advertisedLastRecorded = lastRecordedAfterRenewal
+        stale = remainsInvalidAfterRenewal
+        validatedWhileReadOnly = readOnlyReason != nil
+        do {
+            try validating()
+            gate = nil
+        } catch {
+            gate = "Session validation failed; writes are disabled"
+            throw error
+        }
+    }
+
+    func close() {
+        original.close()
+        if active !== original { active.close() }
+    }
+}
+
+func renewableSessionFixture(_ name: String) throws -> (url: URL, device: RenewableSessionImage, volume: UDFVolume, source: URL) {
+    let url = try writeOnceImage(name + ".img")
+    let device = RenewableSessionImage(try ImageDevice(url: url, writable: true, sequential: true,
+                                                      linkBlocks: 16, appendAlignment: 16, capacityMB: 64))
+    let volume = try UDFVolume.open(device)
+    let source = work.appendingPathComponent(name + "-source.txt")
+    try Data("first recorded version".utf8).write(to: source)
+    return (url, device, volume, source)
+}
+
+test("读会话恢复：DVD-R 添加和替换后的最新 VAT 保持，校验和列表恢复且不追加") {
+    let f = try renewableSessionFixture("renew-valid")
+    defer { f.device.close() }
+    for round in 0 ..< 2 {
+        let data = round == 0 ? Data("first recorded version".utf8) : Data(repeating: 0xA5, count: 8193)
+        try data.write(to: f.source)
+        try f.volume.add(from: f.source, to: "/item.txt", overwrite: round > 0)
+        let latestVAT = f.volume.vatLocation
+        let latestMapping = f.volume.vat
+        let rootSector = try f.volume.sector(f.volume.rootICB)
+        expect(Tag.parse(try f.device.original.readSectors(rootSector, count: 1)) != nil,
+               "底层镜像的新根条目实际有效；错误只来自旧会话")
+        f.device.makeCurrentSessionStale(at: rootSector)
+        f.volume.cache.discard()
+        let bytes = try Data(contentsOf: f.url)
+        let writes = f.device.writes
+        let nwa = try f.device.nextWritableAddress()
+
+        expect(try f.volume.verify("/item.txt", against: f.source), "恢复后应能验证刚添加或替换的版本")
+        expect(try f.volume.list("/").map(\.name) == ["item.txt"])
+        expect(try f.volume.readFile("/item.txt") == Array(data))
+        expect(f.device.renewals == round + 1, "每次新写入可恢复一次，不能永久禁用后续恢复")
+        expect(f.device.staleSingleReads >= round + 1, "应先证明普通单扇区重读仍失败，再重获会话")
+        expect(f.device.validatedWhileReadOnly && f.volume.readOnlyReason == nil)
+        expect(f.volume.vatLocation == latestVAT && f.volume.vat == latestMapping, "不能退回旧 VAT 或旧文件版本")
+        expect(try f.device.nextWritableAddress() == nwa && f.device.writes == writes,
+               "恢复读取不能重写目录、VAT 或重复追加文件")
+        expect(try Data(contentsOf: f.url) == bytes, "会话恢复前后整个镜像字节必须不变")
+    }
+}
+
+test("读会话恢复：旧 VAT 视图被拒绝，保留最新内存状态并禁止继续写入") {
+    let f = try renewableSessionFixture("renew-old-vat")
+    defer { f.device.close() }
+    guard let oldVAT = f.volume.vatLocation else { throw UDFError("需要 VAT 测试卷") }
+    try f.volume.add(from: f.source, to: "/item.txt")
+    let latestVAT = f.volume.vatLocation, latestMapping = f.volume.vat
+    expect(latestVAT != oldVAT)
+    f.device.makeCurrentSessionStale(at: try f.volume.sector(f.volume.rootICB))
+    // All recorded bytes remain readable after renewal, including the newest root.
+    // Only the drive's advertised end points to a valid previous VAT. This catches
+    // adoption of an old view even when a direct read of the new FE would succeed.
+    f.device.lastRecordedAfterRenewal = oldVAT
+    f.volume.cache.discard()
+    let bytes = try Data(contentsOf: f.url), writes = f.device.writes
+    expectThrows({ _ = try f.volume.verify("/item.txt", against: f.source) }, "不能接受旧 VAT 作为恢复成功")
+    expect(f.device.renewals == 1 && f.device.validatedWhileReadOnly)
+    expect(f.volume.readOnlyReason != nil, "验证失败后写权限不能恢复")
+    expect(f.volume.vatLocation == latestVAT && f.volume.vat == latestMapping)
+    expectThrows({ try f.volume.add(from: f.source, to: "/must-not-write.txt") }, "失败恢复后必须拒绝写入")
+    expect(f.device.writes == writes)
+    expect(try Data(contentsOf: f.url) == bytes)
+}
+
+test("读会话恢复：不同光盘不能接管原卷，两个镜像都保持不变") {
+    for operation in ["list", "check"] {
+        let f = try renewableSessionFixture("renew-other-disc-\(operation)")
+        defer { f.device.close() }
+        try f.volume.add(from: f.source, to: "/item.txt")
+        let latestVAT = f.volume.vatLocation, latestMapping = f.volume.vat
+        let otherURL = try writeOnceImage("renew-other-medium-\(operation).img", volumeName: "OTHER_DISC")
+        f.device.imageAfterRenewal = try ImageDevice(url: otherURL, writable: true, sequential: true,
+                                                    linkBlocks: 16, appendAlignment: 16, capacityMB: 64)
+        let child = try f.volume.resolve("/item.txt").fe
+        f.device.makeCurrentSessionStale(at: try f.volume.sector(child.addr))
+        f.volume.cache.discard()
+        let original = try Data(contentsOf: f.url), other = try Data(contentsOf: otherURL)
+        let writes = f.device.writes
+        // Both callers normally tolerate damaged children. An identity failure must
+        // instead escape: neither a zero-sized row nor a mere check warning is safe.
+        expectThrows({
+            if operation == "list" { _ = try f.volume.list("/") }
+            else { _ = try f.volume.check() }
+        }, "不能把异卷错误吞成零字节条目或普通检查问题")
+        expect(f.device.renewals == 1 && f.device.validatedWhileReadOnly)
+        expect(f.volume.readOnlyReason != nil)
+        expect(f.volume.vatLocation == latestVAT && f.volume.vat == latestMapping)
+        expectThrows({ try f.volume.add(from: f.source, to: "/must-not-write.txt") })
+        expect(f.device.writes == writes)
+        expect(try Data(contentsOf: f.url) == original && Data(contentsOf: otherURL) == other)
+    }
+}
+
+test("读会话恢复：重连后仍无效的条目必须失败，不能循环恢复或重新写盘") {
+    let f = try renewableSessionFixture("renew-persistent-invalid")
+    defer { f.device.close() }
+    try f.volume.add(from: f.source, to: "/item.txt")
+    f.device.makeCurrentSessionStale(at: try f.volume.sector(f.volume.rootICB))
+    f.device.remainsInvalidAfterRenewal = true
+    f.volume.cache.discard()
+    let bytes = try Data(contentsOf: f.url), writes = f.device.writes
+    expectThrows({ _ = try f.volume.verify("/item.txt", against: f.source) }, "无法验证的元数据不能当作恢复成功")
+    expect(f.device.renewals == 1, "单次失败读取只能进行一次受控会话恢复")
+    expect(f.volume.readOnlyReason != nil)
+    expectThrows({ try f.volume.add(from: f.source, to: "/must-not-write.txt") })
+    expect(f.device.writes == writes)
+    expect(try Data(contentsOf: f.url) == bytes)
+}
+
+test("读会话恢复：事务进行中或有未提交修改时不得重连或丢弃修改") {
+    let f = try renewableSessionFixture("renew-pending-write")
+    defer { f.device.close() }
+    try f.volume.add(from: f.source, to: "/item.txt")
+    let root = try f.volume.resolve("/").fe
+    let child = try f.volume.resolve("/item.txt").fe
+    f.device.makeCurrentSessionStale(at: try f.volume.sector(child.addr))
+    f.volume.cache.discard()
+    let bytes = try Data(contentsOf: f.url), writes = f.device.writes
+    expectThrows({ try f.volume.transaction { _ = try f.volume.loadFileEntry(child.addr) } },
+                 "事务中普通重读失败必须交给事务，不能释放设备会话")
+    expect(f.device.renewals == 0)
+
+    f.volume.staged[root.addr.block] = root.raw
+    expectThrows({ _ = try f.volume.loadFileEntry(child.addr) })
+    expect(f.device.renewals == 0 && f.volume.staged[root.addr.block] == root.raw,
+           "不能重连或丢弃 staged 元数据")
+    f.volume.staged.removeAll()
+
+    let physicalRoot = try f.volume.sector(root.addr)
+    try f.volume.cache.write(physicalRoot, root.raw, allowDirect: false)
+    expectThrows({ _ = try f.volume.loadFileEntry(child.addr) })
+    expect(f.device.renewals == 0 && f.volume.cache.hasPendingWrites,
+           "不能重连或清除 dirty 包")
+    expect(try f.volume.cache.read(physicalRoot, count: 1) == root.raw)
+    f.volume.cache.discard()
+    expect(f.device.writes == writes)
+    expect(try Data(contentsOf: f.url) == bytes)
 }
 
 // Return names whose unpadded FIDs put the following descriptor tag at the chosen offset.
@@ -739,6 +956,8 @@ test("排序：按种类") {
     expect(EntrySort.kind.sorted(list, ascending: false, kind: { kinds[($0.name as NSString).pathExtension] ?? "" }).map(\.name)
            == ["notes.txt", "report.pdf", "scan.pdf", "photo.jpg"], "降序时同种类仍按名称 A→Z")
 }
+
+await runDiscImportTests()
 
 // MARK: - Report
 

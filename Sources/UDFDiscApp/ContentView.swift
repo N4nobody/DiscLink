@@ -11,8 +11,14 @@ struct ContentView: View {
         } detail: {
             Detail()
         }
-        .sheet(isPresented: Binding(get: { model.busy != nil }, set: { _ in })) {
-            if let b = model.busy { ProgressSheet(busy: b) }
+        .sheet(isPresented: Binding(get: { model.busy != nil || model.preparingImport }, set: { _ in })) {
+            if let conflict = model.importConflict {
+                ImportConflictView(conflict: conflict).environmentObject(model)
+            } else if let b = model.busy {
+                ProgressSheet(busy: b)
+            } else if model.preparingImport {
+                ProgressSheet(busy: Busy(title: L("正在核对文件名…", "Checking filenames…")))
+            }
         }
         .sheet(item: Binding(get: { model.checkReport.map(ReportBox.init) }, set: { if $0 == nil { model.checkReport = nil } })) {
             CheckReportView(report: $0.report)
